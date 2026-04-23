@@ -1,0 +1,11 @@
+{
+  "pb_token": "lrGBDS12Bt1nr5nH",
+  "feishu_app_id": "cli_a8517363cf3bd013",
+  "feishu_app_secret": "O4Sm3UNHjpykF9OZq3LroblsrCVYyQEp",
+  "feishu_spreadsheet_token": "KnJ1wphpBiVMrGkWl5ncUkMGnfe",
+  "feishu_sheet_id": "kPlW5z",
+  "google_developer_token": "1YsRjWGxV6XUdxtX8MiT3Q",
+  "google_mcc_id": "6885177935",
+  "google_service_account_file": "credentials/google_ads_service_account.json",
+  "save_path": "C:\\Users\\Administrator\\Desktop\\offers.xlsx"
+}
