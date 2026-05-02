@@ -148,6 +148,9 @@ class OfferToolApp:
             "google_developer_token": "1YsRjWGxV6XUdxtX8MiT3Q",
             "google_mcc_id": "6885177935",
             "google_service_account_file": "credentials/google_ads_service_account.json",
+            "google_service_account_key": "",
+            "stats_start_date": "2026-01-01",
+            "stats_increment_days": "7",
             # 保存路径
             "save_path": os.path.join(os.path.expanduser("~"), "Desktop", "offers.xlsx")
         }
@@ -158,11 +161,37 @@ class OfferToolApp:
                     default_config.update(saved_config)
         except Exception:
             pass
+        if not default_config.get("google_service_account_key"):
+            default_config["google_service_account_key"] = self.load_google_service_account_key(
+                default_config.get("google_service_account_file", "")
+            )
         return default_config
+
+    def load_google_service_account_key(self, sa_file):
+        """读取服务账号密钥文本"""
+        try:
+            if sa_file and os.path.exists(sa_file):
+                with open(sa_file, 'r', encoding='utf-8') as f:
+                    return f.read()
+        except Exception:
+            pass
+        return ""
+
+    def save_google_service_account_key(self, sa_file, key_text):
+        """保存服务账号密钥文本"""
+        if not sa_file:
+            return
+
+        sa_dir = os.path.dirname(sa_file)
+        if sa_dir and not os.path.exists(sa_dir):
+            os.makedirs(sa_dir, exist_ok=True)
+        with open(sa_file, 'w', encoding='utf-8') as f:
+            f.write(key_text.strip())
     
     def save_config(self):
         """保存配置文件"""
         try:
+            key_text = self.google_sa_key_var.get("1.0", tk.END).strip()
             config_to_save = {
                 "pb_token": self.pb_token_var.get().strip(),
                 "feishu_app_id": self.feishu_app_id_var.get().strip(),
@@ -172,10 +201,14 @@ class OfferToolApp:
                 "google_developer_token": self.google_dev_token_var.get().strip(),
                 "google_mcc_id": self.google_mcc_id_var.get().strip(),
                 "google_service_account_file": self.google_sa_file_var.get().strip(),
+                "google_service_account_key": key_text,
+                "stats_start_date": self.stats_start_date_var.get().strip() if hasattr(self, 'stats_start_date_var') else self.config.get("stats_start_date", "2026-01-01"),
+                "stats_increment_days": self.stats_increment_days_var.get().strip() if hasattr(self, 'stats_increment_days_var') else self.config.get("stats_increment_days", "7"),
                 "save_path": self.save_path_var.get()
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config_to_save, f, ensure_ascii=False, indent=2)
+            self.save_google_service_account_key(config_to_save["google_service_account_file"], key_text)
         except Exception as e:
             print(f"保存配置失败: {e}")
 
@@ -263,6 +296,15 @@ class OfferToolApp:
         
         self.brand_search_btn = ttk.Button(button_frame, text="获取品牌搜索量报告", command=self.get_brand_search_volume)
         self.brand_search_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.brand_search_scope_var = tk.StringVar(value="全量")
+        ttk.Combobox(
+            button_frame,
+            textvariable=self.brand_search_scope_var,
+            values=["50个", "全量"],
+            width=8,
+            state='readonly'
+        ).pack(side=tk.LEFT, padx=(0, 10))
         
         self.progress_label_get = ttk.Label(button_frame, text="")
         self.progress_label_get.pack(side=tk.RIGHT, padx=(10, 0))
@@ -295,6 +337,30 @@ class OfferToolApp:
 • "offer顺序整理"：对Offer表和广告系列表排序（按状态分组+总佣金降序）"""
         ttk.Label(info_frame, text=info_text, justify=tk.LEFT).pack(anchor=tk.W)
         
+        # 统计参数区域
+        date_frame = ttk.Frame(main_frame)
+        date_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(date_frame, text="开始日期:").pack(side=tk.LEFT)
+        self.stats_start_date_var = tk.StringVar(value=self.config.get("stats_start_date", "2026-01-01"))
+        ttk.Entry(date_frame, textvariable=self.stats_start_date_var, width=12).pack(side=tk.LEFT, padx=(5, 10))
+
+        ttk.Label(date_frame, text="结束日期:").pack(side=tk.LEFT)
+        self.stats_end_date_var = tk.StringVar(value=datetime.now().strftime('%Y-%m-%d'))
+        self.stats_end_date_entry = ttk.Entry(date_frame, textvariable=self.stats_end_date_var, width=12)
+        self.stats_end_date_entry.pack(side=tk.LEFT, padx=(5, 10))
+
+        self.stats_to_today_var = tk.IntVar(value=1)
+        self.stats_to_today_check = ttk.Checkbutton(
+            date_frame, text="至今", variable=self.stats_to_today_var, command=self._on_stats_to_today_changed
+        )
+        self.stats_to_today_check.pack(side=tk.LEFT, padx=(0, 15))
+        self._on_stats_to_today_changed()
+
+        ttk.Label(date_frame, text="新增花费/佣金统计天数:").pack(side=tk.LEFT)
+        self.stats_increment_days_var = tk.StringVar(value=self.config.get("stats_increment_days", "7"))
+        ttk.Entry(date_frame, textvariable=self.stats_increment_days_var, width=6).pack(side=tk.LEFT, padx=(5, 10))
+
         # 操作按钮区域
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(0, 10))
@@ -326,6 +392,14 @@ class OfferToolApp:
         
         # 停止标志
         self.stop_flag = False
+
+    def _on_stats_to_today_changed(self):
+        """切换统计结束日期是否固定为今天"""
+        if self.stats_to_today_var.get():
+            self.stats_end_date_entry.config(state='disabled')
+            self.stats_end_date_var.set(datetime.now().strftime('%Y-%m-%d'))
+        else:
+            self.stats_end_date_entry.config(state='normal')
 
     # ==================== 配置选项卡 ====================
     def create_config_tab(self):
@@ -375,17 +449,35 @@ class OfferToolApp:
         ttk.Label(google_frame, text="MCC ID:", width=20, anchor=tk.W).grid(row=1, column=0, sticky=tk.W, pady=5)
         self.google_mcc_id_var = tk.StringVar(value=self.config.get("google_mcc_id", ""))
         ttk.Entry(google_frame, textvariable=self.google_mcc_id_var, width=50).grid(row=1, column=1, sticky=tk.W, pady=5)
-        
-        ttk.Label(google_frame, text="服务账号文件:", width=20, anchor=tk.W).grid(row=2, column=0, sticky=tk.W, pady=5)
+
         self.google_sa_file_var = tk.StringVar(value=self.config.get("google_service_account_file", ""))
-        ttk.Entry(google_frame, textvariable=self.google_sa_file_var, width=40).grid(row=2, column=1, sticky=tk.W, pady=5)
-        ttk.Button(google_frame, text="浏览", command=self.browse_sa_file).grid(row=2, column=2, sticky=tk.W, pady=5, padx=5)
+
+        ttk.Label(google_frame, text="服务账号密钥:", width=20, anchor=tk.NW).grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.google_sa_key_var = scrolledtext.ScrolledText(google_frame, width=58, height=12, font=('Consolas', 9))
+        self.google_sa_key_var.grid(row=2, column=1, sticky=tk.W, pady=5)
+        self.google_sa_key_var.insert("1.0", self.config.get("google_service_account_key", ""))
+
+        guide_text = (
+            "MCC账号更换流程\n"
+            "①准备一个有Basic Access的mcc账号\n"
+            "②去一个已经开通google ads api的google cloud账号（比如mcc1）\n"
+            "③创建新项目→创建新服务账号→创建服务账号的密钥\n"
+            "④新mcc账号后台，拉新服务账号，给予权限\n"
+            "⑤该卡片填入所有信息"
+        )
+        ttk.Label(
+            google_frame,
+            text=guide_text,
+            justify=tk.LEFT,
+            foreground="#808080"
+        ).grid(row=0, column=2, rowspan=3, sticky=tk.NW, padx=(20, 0), pady=5)
         
         # 保存按钮
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=10)
         ttk.Button(btn_frame, text="保存配置", command=self.save_and_notify).pack(side=tk.LEFT)
-        ttk.Button(btn_frame, text="测试连接", command=self.test_connections).pack(side=tk.LEFT, padx=10)
+        self.test_conn_btn = ttk.Button(btn_frame, text="测试连接", command=self.test_connections)
+        self.test_conn_btn.pack(side=tk.LEFT, padx=10)
 
     # ==================== 通用方法 ====================
     def browse_save_path(self):
@@ -397,33 +489,39 @@ class OfferToolApp:
         if file_path:
             self.save_path_var.set(file_path)
     
-    def browse_sa_file(self):
-        file_path = filedialog.askopenfilename(
-            filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")],
-            title="选择服务账号文件"
-        )
-        if file_path:
-            self.google_sa_file_var.set(file_path)
-    
     def save_and_notify(self):
         self.save_config()
         messagebox.showinfo("成功", "配置已保存！")
+
+    def _run_on_ui_thread(self, func):
+        """确保Tkinter控件只在主线程更新"""
+        try:
+            self.root.after(0, func)
+        except Exception:
+            pass
+
+    def _append_log_text(self, text_widget, message, timestamp_fmt):
+        """线程安全地向日志框追加内容"""
+        def _append():
+            timestamp = datetime.now().strftime(timestamp_fmt)
+            text_widget.insert(tk.END, f"[{timestamp}] {message}\n")
+            text_widget.see(tk.END)
+            self.root.update_idletasks()
+        self._run_on_ui_thread(_append)
     
     def log_get(self, message):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.log_text_get.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text_get.see(tk.END)
-        self.root.update_idletasks()
+        self._append_log_text(self.log_text_get, message, "%Y-%m-%d %H:%M:%S")
         # 同时写入日志文件
         self.write_log_to_file(f"[Offer获取] {message}")
     
     def log_manage(self, message):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text_manage.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text_manage.see(tk.END)
-        self.root.update_idletasks()
+        self._append_log_text(self.log_text_manage, message, "%H:%M:%S")
         # 同时写入日志文件
         self.write_log_to_file(message)
+
+    def log_config(self, message):
+        """API配置页日志"""
+        self.write_log_to_file(f"[API配置] {message}")
     
     def log_debug(self, message):
         """写入调试日志（仅写入文件，不显示在GUI中）"""
@@ -435,12 +533,16 @@ class OfferToolApp:
             pass  # 调试日志写入失败不影响主程序
     
     def update_progress_get(self, text):
-        self.progress_label_get.config(text=text)
-        self.root.update_idletasks()
+        self._run_on_ui_thread(lambda: (
+            self.progress_label_get.config(text=text),
+            self.root.update_idletasks()
+        ))
     
     def update_progress_manage(self, text):
-        self.progress_label_manage.config(text=text)
-        self.root.update_idletasks()
+        self._run_on_ui_thread(lambda: (
+            self.progress_label_manage.config(text=text),
+            self.root.update_idletasks()
+        ))
 
     # ==================== Offer获取功能 ====================
     def build_request_body(self, page):
@@ -1018,6 +1120,13 @@ class OfferToolApp:
                 return
             
             self.log_get(f"  共获取到 {len(brands)} 个品牌")
+
+            scope = self.brand_search_scope_var.get().strip() if hasattr(self, 'brand_search_scope_var') else "全量"
+            if scope == "50个":
+                brands = brands[:50]
+                self.log_get("  已选择测试模式：仅处理前50个品牌")
+            else:
+                self.log_get("  已选择全量模式：处理全部品牌")
             
             # 步骤2：解析品牌名和国家代码
             self.log_get("\n【步骤2】解析品牌名和国家代码...")
@@ -1149,10 +1258,11 @@ class OfferToolApp:
             self.log_get("\n【步骤5】查询各品牌产品数量...")
             self.update_progress_get("查询产品数量...")
             
-            product_count_map = self._get_brand_product_counts(all_bids)
+            product_count_map, commission_raw_map = self._get_brand_product_counts(all_bids)
             
             for r in results:
                 r['product_count'] = product_count_map.get(str(r.get('bid', '')), 0)
+                r['commission_raw'] = commission_raw_map.get(str(r.get('bid', '')), '')
             
             has_products = sum(1 for v in product_count_map.values() if v > 0)
             total_products = sum(product_count_map.values())
@@ -1254,8 +1364,9 @@ class OfferToolApp:
         return storefront_map
     
     def _get_brand_product_counts(self, bids):
-        """查询各品牌的产品数量，返回 {bid: count} 映射"""
+        """查询各品牌的产品数量和佣金字段，返回 ({bid: count}, {bid: commission_raw})"""
         count_map = {}
+        commission_raw_map = {}
         token = self.pb_token_var.get().strip()
         url = f"{PB_API_BASE_URL}/api/datafeed/get_fba_products"
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -1267,6 +1378,7 @@ class OfferToolApp:
                 continue
             
             product_count = 0
+            commission_raw = ''
             page = 1
             has_more = True
             
@@ -1293,6 +1405,12 @@ class OfferToolApp:
                     if data.get("status", {}).get("code") == 0:
                         products = data.get("data", {}).get("list", [])
                         product_count += len(products)
+                        if not commission_raw:
+                            for product in products:
+                                raw_commission = str(product.get('commission', '')).strip()
+                                if raw_commission:
+                                    commission_raw = raw_commission
+                                    break
                         has_more = data.get("data", {}).get("has_more", False)
                         page += 1
                     else:
@@ -1303,12 +1421,13 @@ class OfferToolApp:
                 time.sleep(0.1)
             
             count_map[bid_str] = product_count
+            commission_raw_map[bid_str] = commission_raw
             
             if (idx + 1) % 10 == 0 or idx == total - 1:
                 self.log_get(f"    产品数量查询进度: {idx+1}/{total}")
                 self.update_progress_get(f"产品数量 {idx+1}/{total}...")
         
-        return count_map
+        return count_map, commission_raw_map
     
     def _parse_brand_name_country(self, raw_name):
         """从品牌名中智能解析品牌名和国家代码
@@ -1381,6 +1500,17 @@ class OfferToolApp:
         'TR': '1037',  # Turkish
         'EG': '1019',  # Arabic
     }
+
+    COUNTRY_CODE_ALIASES = {
+        'GB': 'UK',
+    }
+
+    def normalize_country_code(self, country_code):
+        """标准化国家代码，统一历史别名，便于跨表匹配。"""
+        code = str(country_code or '').upper().strip()
+        if not code:
+            return ''
+        return self.COUNTRY_CODE_ALIASES.get(code, code)
     
     def _get_keyword_historical_metrics(self, client, customer_id, keywords, country_code):
         """调用Google Ads API获取关键词历史搜索量指标
@@ -1402,7 +1532,8 @@ class OfferToolApp:
         request.keywords.extend(keywords)
         
         # 设置地理位置
-        geo_id = self.GEO_TARGET_MAP.get(country_code.upper(), '2840')  # 默认US
+        normalized_country = self.normalize_country_code(country_code)
+        geo_id = self.GEO_TARGET_MAP.get(normalized_country, '2840')  # 默认US
         request.geo_target_constants.append(
             googleads_service.geo_target_constant_path(geo_id)
         )
@@ -1411,7 +1542,7 @@ class OfferToolApp:
         request.keyword_plan_network = client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
         
         # 设置语言
-        lang_id = self.LANGUAGE_MAP.get(country_code.upper(), '1000')  # 默认English
+        lang_id = self.LANGUAGE_MAP.get(normalized_country, '1000')  # 默认English
         request.language = googleads_service.language_constant_path(lang_id)
         
         response = keyword_plan_idea_service.generate_keyword_historical_metrics(
@@ -1443,7 +1574,7 @@ class OfferToolApp:
         ws.title = "品牌搜索量报告"
         
         # 表头
-        headers = ['Brand ID', 'Storefront Link', '产品数量', '原始品牌名', '品牌名', '国家代码', '月均搜索量', 
+        headers = ['Brand ID', 'Storefront Link', '产品数量', '佣金比例', '原始品牌名', '品牌名', '国家代码', '月均搜索量', 
                    '竞争程度', '竞争指数', '页首低价出价($)', '页首高价出价($)']
         ws.append(headers)
         
@@ -1453,6 +1584,7 @@ class OfferToolApp:
                 r.get('bid', ''),
                 r.get('storefront_link', ''),
                 r.get('product_count', 0),
+                r.get('commission_raw', ''),
                 r.get('raw_name', ''),
                 r.get('brand_name', ''),
                 r.get('country_code', ''),
@@ -1475,7 +1607,7 @@ class OfferToolApp:
         
         # 按月均搜索量降序排序（表头行之后）
         data_rows = list(ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True))
-        data_rows.sort(key=lambda x: (x[6] if isinstance(x[6], (int, float)) else 0), reverse=True)
+        data_rows.sort(key=lambda x: (x[7] if isinstance(x[7], (int, float)) else 0), reverse=True)
         
         # 清除数据行，重新写入排序后的数据
         for row_idx in range(2, ws.max_row + 1):
@@ -1510,6 +1642,7 @@ class OfferToolApp:
                 ("品牌名称", "brand_name", False),
                 ("折扣价", "discount_price", False),
                 ("佣金", "commission", False),
+                ("Reviews", "reviews", False),
                 ("产品ID", "product_id", True),
                 ("产品名称", "product_name", False),
                 ("图片URL", "image", True),
@@ -1523,7 +1656,6 @@ class OfferToolApp:
                 ("变体ASIN", "variant_asin", True),
                 ("库存状态", "availability", False),
                 ("评分", "rating", True),
-                ("评论数", "reviews", True),
                 ("产品链接", "url", False),
                 ("品牌ID", "brand_id", False),
                 ("更新时间", "update_time", False),
@@ -1579,61 +1711,93 @@ class OfferToolApp:
     # ==================== Offer管理功能 ====================
     def test_connections(self):
         """测试所有API连接"""
+        if hasattr(self, 'test_conn_btn'):
+            self.test_conn_btn.config(state='disabled')
         self.log_text_manage.delete(1.0, tk.END)
         thread = threading.Thread(target=self._do_test_connections)
         thread.daemon = True
         thread.start()
     
     def _do_test_connections(self):
-        self.log_manage("开始测试API连接...")
-        
-        # 测试飞书
-        self.log_manage("\n[飞书API]")
         try:
-            token = self.get_feishu_token()
-            if token:
-                self.log_manage("  ✓ 飞书Token获取成功")
-            else:
-                self.log_manage("  ✗ 飞书Token获取失败")
-        except Exception as e:
-            self.log_manage(f"  ✗ 飞书连接失败: {e}")
-        
-        # 测试Google Ads
-        self.log_manage("\n[Google Ads API]")
-        try:
-            client = self.get_google_ads_client()
-            if client:
-                customer_service = client.get_service('CustomerService')
-                accessible_customers = customer_service.list_accessible_customers()
-                self.log_manage(f"  ✓ Google Ads连接成功，可访问 {len(accessible_customers.resource_names)} 个账户")
-            else:
-                self.log_manage("  ✗ Google Ads客户端创建失败")
-        except Exception as e:
-            self.log_manage(f"  ✗ Google Ads连接失败: {e}")
-        
-        # 测试PartnerBoost
-        self.log_manage("\n[PartnerBoost API]")
-        try:
-            url = f"{PB_API_BASE_URL}/api.php?mod=medium&op=transaction"
-            body = {
-                "token": self.pb_token_var.get().strip(),
-                "begin_date": (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d'),
-                "end_date": datetime.now().strftime('%Y-%m-%d'),
-                "type": "json",
-                "status": "All",
-                "limit": 1,
-                "page": 1
-            }
-            response = requests.post(url, json=body, timeout=30)
-            data = response.json()
-            if data.get("status", {}).get("code") == 0:
-                self.log_manage("  ✓ PartnerBoost连接成功")
-            else:
-                self.log_manage(f"  ✗ PartnerBoost返回错误: {data.get('status', {}).get('msg')}")
-        except Exception as e:
-            self.log_manage(f"  ✗ PartnerBoost连接失败: {e}")
-        
-        self.log_manage("\n测试完成！")
+            results = []
+
+            self.log_manage("开始测试API连接...")
+            self.log_config("开始测试API连接...")
+            
+            # 测试飞书
+            self.log_manage("\n[飞书API]")
+            self.log_config("\n[飞书API]")
+            try:
+                token = self.get_feishu_token()
+                if token:
+                    self.log_manage("  ✓ 飞书Token获取成功")
+                    self.log_config("  ✓ 飞书Token获取成功")
+                    results.append("飞书: 成功")
+                else:
+                    self.log_manage("  ✗ 飞书Token获取失败")
+                    self.log_config("  ✗ 飞书Token获取失败")
+                    results.append("飞书: 失败")
+            except Exception as e:
+                self.log_manage(f"  ✗ 飞书连接失败: {e}")
+                self.log_config(f"  ✗ 飞书连接失败: {e}")
+                results.append("飞书: 失败")
+            
+            # 测试Google Ads
+            self.log_manage("\n[Google Ads API]")
+            self.log_config("\n[Google Ads API]")
+            try:
+                client = self.get_google_ads_client()
+                if client:
+                    customer_service = client.get_service('CustomerService')
+                    accessible_customers = customer_service.list_accessible_customers()
+                    self.log_manage(f"  ✓ Google Ads连接成功，可访问 {len(accessible_customers.resource_names)} 个账户")
+                    self.log_config(f"  ✓ Google Ads连接成功，可访问 {len(accessible_customers.resource_names)} 个账户")
+                    results.append("Google Ads: 成功")
+                else:
+                    self.log_manage("  ✗ Google Ads客户端创建失败")
+                    self.log_config("  ✗ Google Ads客户端创建失败")
+                    results.append("Google Ads: 失败")
+            except Exception as e:
+                self.log_manage(f"  ✗ Google Ads连接失败: {e}")
+                self.log_config(f"  ✗ Google Ads连接失败: {e}")
+                results.append("Google Ads: 失败")
+            
+            # 测试PartnerBoost
+            self.log_manage("\n[PartnerBoost API]")
+            self.log_config("\n[PartnerBoost API]")
+            try:
+                url = f"{PB_API_BASE_URL}/api.php?mod=medium&op=transaction"
+                body = {
+                    "token": self.pb_token_var.get().strip(),
+                    "begin_date": (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d'),
+                    "end_date": datetime.now().strftime('%Y-%m-%d'),
+                    "type": "json",
+                    "status": "All",
+                    "limit": 1,
+                    "page": 1
+                }
+                response = requests.post(url, json=body, timeout=30)
+                data = response.json()
+                if data.get("status", {}).get("code") == 0:
+                    self.log_manage("  ✓ PartnerBoost连接成功")
+                    self.log_config("  ✓ PartnerBoost连接成功")
+                    results.append("PartnerBoost: 成功")
+                else:
+                    self.log_manage(f"  ✗ PartnerBoost返回错误: {data.get('status', {}).get('msg')}")
+                    self.log_config(f"  ✗ PartnerBoost返回错误: {data.get('status', {}).get('msg')}")
+                    results.append("PartnerBoost: 失败")
+            except Exception as e:
+                self.log_manage(f"  ✗ PartnerBoost连接失败: {e}")
+                self.log_config(f"  ✗ PartnerBoost连接失败: {e}")
+                results.append("PartnerBoost: 失败")
+            
+            self.log_manage("\n测试完成！")
+            self.log_config("\n测试完成！")
+            summary = "\n".join(results)
+            self._run_on_ui_thread(lambda: messagebox.showinfo("测试完成", summary))
+        finally:
+            self._run_on_ui_thread(lambda: self.test_conn_btn.config(state='normal'))
     
     def get_feishu_token(self):
         """获取飞书tenant_access_token"""
@@ -1650,12 +1814,13 @@ class OfferToolApp:
     
     def get_google_ads_client(self):
         """创建Google Ads客户端"""
-        sa_file = self.google_sa_file_var.get().strip()
-        if not os.path.exists(sa_file):
+        key_text = self.google_sa_key_var.get("1.0", tk.END).strip()
+        if not key_text:
             return None
-        
-        credentials = service_account.Credentials.from_service_account_file(
-            sa_file,
+
+        sa_info = json.loads(key_text)
+        credentials = service_account.Credentials.from_service_account_info(
+            sa_info,
             scopes=['https://www.googleapis.com/auth/adwords']
         )
         
@@ -1669,14 +1834,58 @@ class OfferToolApp:
     
     def start_statistics(self):
         """开始统计"""
+        start_date_str = self.stats_start_date_var.get().strip()
+        if not start_date_str:
+            messagebox.showerror("错误", "请输入统计开始日期，格式为 YYYY-MM-DD")
+            return
+
+        try:
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+        except ValueError:
+            messagebox.showerror("错误", "开始日期格式错误，请使用 YYYY-MM-DD")
+            return
+
+        if self.stats_to_today_var.get():
+            end_date_str = datetime.now().strftime('%Y-%m-%d')
+            self.stats_end_date_var.set(end_date_str)
+        else:
+            end_date_str = self.stats_end_date_var.get().strip()
+            if not end_date_str:
+                messagebox.showerror("错误", "请输入统计结束日期，格式为 YYYY-MM-DD，或勾选“至今”")
+                return
+
+        try:
+            end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+        except ValueError:
+            messagebox.showerror("错误", "结束日期格式错误，请使用 YYYY-MM-DD")
+            return
+
+        if start_date > end_date:
+            messagebox.showerror("错误", "开始日期不能晚于结束日期")
+            return
+
+        increment_days_str = self.stats_increment_days_var.get().strip()
+        if not increment_days_str:
+            messagebox.showerror("错误", "请输入新增花费/佣金统计天数")
+            return
+        try:
+            increment_days = int(increment_days_str)
+        except ValueError:
+            messagebox.showerror("错误", "新增花费/佣金统计天数必须是正整数")
+            return
+        if increment_days <= 0:
+            messagebox.showerror("错误", "新增花费/佣金统计天数必须大于0")
+            return
+
         self.stop_flag = False
         self.start_stats_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
+        self.update_offers_btn.config(state='disabled')
         self.sort_tables_btn.config(state='disabled')
         self.progress_manage.start()
         self.log_text_manage.delete(1.0, tk.END)
         
-        thread = threading.Thread(target=self._do_statistics)
+        thread = threading.Thread(target=self._do_statistics, args=(start_date_str, end_date_str, increment_days))
         thread.daemon = True
         thread.start()
     
@@ -2456,18 +2665,20 @@ class OfferToolApp:
             except:
                 return 0.0
     
-    def _do_statistics(self):
+    def _do_statistics(self, start_date_str, end_date_str, increment_days):
         """执行统计操作"""
         try:
             self.log_manage("=" * 50)
             self.log_manage("开始Offer统计...")
+            self.log_manage(f"统计日期范围: {start_date_str} 至 {end_date_str}")
+            self.log_manage(f"新增花费/佣金统计天数: {increment_days}")
             self.log_manage("=" * 50)
             
             # 步骤1：获取Google Ads广告系列信息
             self.log_manage("\n【步骤1】获取Google Ads广告系列信息")
             self.update_progress_manage("获取广告系列...")
             
-            campaign_data, succeeded_account_ids = self.get_all_campaigns_with_asin()
+            campaign_data, succeeded_account_ids = self.get_all_campaigns_with_asin(start_date_str, end_date_str)
             if self.stop_flag:
                 self.log_manage("已停止")
                 return
@@ -2488,7 +2699,7 @@ class OfferToolApp:
             campaigns_without_country = 0
             for campaign in campaign_data:
                 asin = campaign.get('asin')
-                country = campaign.get('country')
+                country = self.normalize_country_code(campaign.get('country'))
                 if asin and country:
                     key = (asin, country)
                     if key not in asin_country_campaigns:
@@ -2540,49 +2751,11 @@ class OfferToolApp:
                     status_val = row.get('状态', 'N/A')
                     self.log_manage(f"    [{i+1}] ASIN={asin_val}, 状态={status_val}")
             
-            # 读取当前"总计"行的数值（用于后续计算新增量）
-            previous_total_cost = 0
-            previous_total_commission = 0
-            for row in feishu_data:
-                if row.get('row_index') == 2:  # 总计行
-                    # 读取当前总花费
-                    cost_val = row.get('广告系列总花费', '')
-                    if cost_val:
-                        try:
-                            # 处理格式：$1838.68 或 1838.68
-                            cost_str = str(cost_val).replace('$', '').replace(',', '').strip()
-                            # 如果有括号（如"$1143.82（$35.63）"），只取括号前的部分
-                            if '（' in cost_str:
-                                cost_str = cost_str.split('（')[0]
-                            if cost_str:
-                                previous_total_cost = float(cost_str)
-                        except (ValueError, TypeError):
-                            pass
-                    
-                    # 读取当前总佣金
-                    commission_val = row.get('总佣金', '')
-                    if commission_val:
-                        try:
-                            commission_str = str(commission_val).replace('$', '').replace(',', '').strip()
-                            # 支持新格式: "4481.79 (+133.91-278.33)" -> 取第一个数字
-                            # 也支持旧格式: "1143.82（35.63+80.93）" 或 "1143.82"
-                            if ' (' in commission_str:
-                                commission_str = commission_str.split(' (')[0]
-                            elif '（' in commission_str:
-                                commission_str = commission_str.split('（')[0]
-                            if commission_str:
-                                previous_total_commission = float(commission_str)
-                        except (ValueError, TypeError):
-                            pass
-                    break
-            
-            self.log_manage(f"  当前总计行: 总花费=${previous_total_cost:.2f}, 总佣金=${previous_total_commission:.2f}")
-            
             # 步骤3：获取PartnerBoost佣金数据
             self.log_manage("\n【步骤3】获取PartnerBoost佣金数据")
             self.update_progress_manage("获取佣金数据...")
             
-            commission_data = self.get_all_commissions()
+            commission_data = self.get_all_commissions(start_date_str, end_date_str)
             if self.stop_flag:
                 return
             
@@ -2602,6 +2775,8 @@ class OfferToolApp:
             skipped_no_asin = 0
             skipped_rejected = 0
             rejected_commission_total = 0  # Rejected状态的佣金总额
+            non_rejected_commission_total = 0  # 非Rejected佣金总额
+            gross_commission_total = 0     # 所有状态的佣金总额（含Rejected）
             country_from_customer = 0      # 从 customer_country 字段获取
             country_from_merchant = 0      # 从 merchant_name 提取
             country_from_mcid = 0          # 从 mcid 提取
@@ -2617,12 +2792,16 @@ class OfferToolApp:
             asin_only_commission = {}  # {asin: total_commission} 无uid且国家默认US
             
             for trans in commission_data:
+                comm = float(trans.get('sale_comm', 0) or 0)
+                gross_commission_total += comm
+
                 if trans.get('status') == 'Rejected':
                     skipped_rejected += 1
                     # 累加Rejected佣金
-                    rejected_comm = float(trans.get('sale_comm', 0) or 0)
-                    rejected_commission_total += rejected_comm
+                    rejected_commission_total += comm
                     continue
+                else:
+                    non_rejected_commission_total += comm
                     
                 asin = trans.get('prod_id', '')
                 merchant_name = trans.get('merchant_name', '')
@@ -2654,8 +2833,6 @@ class OfferToolApp:
                     skipped_no_asin += 1
                     continue
                 
-                comm = float(trans.get('sale_comm', 0) or 0)
-                
                 # 统计国家代码来源
                 if country_source == 'customer_country':
                     country_from_customer += 1
@@ -2666,7 +2843,7 @@ class OfferToolApp:
                 else:
                     country_default_us += 1
                 
-                country = country.upper()
+                country = self.normalize_country_code(country)
                 key = (asin, country)
                 
                 # 总映射（所有交易，用于总计计算）
@@ -2723,7 +2900,15 @@ class OfferToolApp:
             if row_campaigns:
                 self.log_manage(f"  已精确分配 {len(row_campaigns)} 行的广告系列")
             
-            updates = self.calculate_updates(feishu_data, asin_country_campaigns, asin_country_commission, asin_only_commission, asin_country_uid_commission, asin_country_no_uid_commission, row_campaigns)
+            updates, offer_commission_context = self.calculate_updates(
+                feishu_data,
+                asin_country_campaigns,
+                asin_country_commission,
+                asin_only_commission,
+                asin_country_uid_commission,
+                asin_country_no_uid_commission,
+                row_campaigns
+            )
             
             self.log_manage(f"  计算得到 {len(updates)} 个需要更新的offer")
             
@@ -2753,7 +2938,7 @@ class OfferToolApp:
                 if asin:
                     feishu_asin_set.add(asin)
                     if country:
-                        feishu_asin_country_set.add((asin, country.upper().strip()))
+                        feishu_asin_country_set.add((asin, self.normalize_country_code(country)))
             
             # 1. 未匹配到offer的广告系列统计
             unmatched_campaigns = []
@@ -2893,9 +3078,9 @@ class OfferToolApp:
                 total_pb_non_rejected = sum(asin_country_commission.values())
                 self.log_manage(f"  PB佣金校验: PB总额(非Rejected)=${total_pb_non_rejected:.2f} = 已匹配${total_commission_sum:.2f} + 未匹配${total_unmatched_commission:.2f}")
                 
-                # 总花费：从MCC获取2026-01-01至今的全部花费（包含已删除的广告系列）
+                # 总花费：从MCC获取选定日期范围内的全部花费（包含已删除广告系列）
                 self.log_manage(f"  从MCC获取全部花费（含已删除广告系列）...")
-                mcc_total_cost = self.get_mcc_total_cost()
+                mcc_total_cost = self.get_mcc_total_cost(start_date_str, end_date_str)
                 if mcc_total_cost is not None:
                     total_cost_sum = mcc_total_cost
                 else:
@@ -2904,24 +3089,37 @@ class OfferToolApp:
                     self.log_manage(f"  ⚠ 无法获取MCC全部花费，使用当前广告系列花费")
                 
                 self.log_manage(f"  飞书表格所有Offer汇总:")
-                self.log_manage(f"    • 已匹配佣金: ${total_commission_sum:.2f}")
-                self.log_manage(f"    • 未匹配佣金: ${total_unmatched_commission:.2f}")
+                self.log_manage(f"    • 非Rejected佣金: ${non_rejected_commission_total:.2f}")
+                self.log_manage(f"    • 总佣金: ${gross_commission_total:.2f}")
                 self.log_manage(f"    • Rejected佣金: ${rejected_commission_total:.2f}")
                 self.log_manage(f"    • MCC总花费(USD): ${total_cost_sum:.2f}")
                 
-                # 计算新增量（本次统计值 - 上次记录值）
-                new_cost_increment = total_cost_sum - previous_total_cost
-                new_commission_increment = total_commission_sum - previous_total_commission
-                
-                self.log_manage(f"  📈 新增数据（相比上次运行）:")
-                self.log_manage(f"    • 新增广告花费: ${new_cost_increment:.2f}")
-                self.log_manage(f"    • 新增佣金: ${new_commission_increment:.2f}")
-                
                 # 更新第二行（总计行），传入未匹配佣金和Rejected佣金
-                self.update_feishu_summary_row(feishu_token, total_commission_sum, total_cost_sum, total_unmatched_commission, rejected_commission_total)
+                self.update_feishu_summary_row(
+                    feishu_token,
+                    non_rejected_commission_total,
+                    total_cost_sum,
+                    gross_commission_total,
+                    rejected_commission_total
+                )
                 
             except Exception as e:
                 self.log_manage(f"  更新总计行时出错: {str(e)}")
+
+            # 输出最近N天新增数据
+            self.log_manage("\n【步骤5.5】输出新增数据")
+            self.update_progress_manage("统计新增数据...")
+            try:
+                daily_changes = self.get_recent_daily_changes(increment_days)
+                self.log_manage("  新增数据:")
+                for item in daily_changes:
+                    self.log_manage(
+                        f"  【{item['date']}】新增花费${item['cost']:.2f}；"
+                        f"新增佣金${item['commission']:.2f}；"
+                        f"利润${item['profit']:.2f}；"
+                    )
+            except Exception as e:
+                self.log_manage(f"  统计新增数据时出错: {str(e)}")
             
             # 步骤6：更新"广告系列"表格
             self.log_manage("\n【步骤6】更新'广告系列'表格")
@@ -2952,17 +3150,57 @@ class OfferToolApp:
                     if campaign_id_to_tracking_link:
                         self.log_manage(f"  构建了 {len(campaign_id_to_tracking_link)} 个广告系列→投放链接的精确映射")
                 
-                self.update_campaigns_sheet(
+                campaign_sheet_report = self.update_campaigns_sheet(
                     feishu_token=feishu_token,
                     campaign_data=campaign_data,
                     commission_data=commission_data,
                     feishu_data=feishu_data,
-                    campaign_id_to_tracking_link=campaign_id_to_tracking_link
+                    campaign_id_to_tracking_link=campaign_id_to_tracking_link,
+                    offer_commission_context=offer_commission_context
                 )
             except Exception as e:
                 self.log_manage(f"  更新广告系列表格时出错: {str(e)}")
                 import traceback
                 self.log_manage(traceback.format_exc())
+                campaign_sheet_report = None
+
+            if campaign_sheet_report:
+                uid_conflicts = campaign_sheet_report.get('uid_conflicts', [])
+                unmatched_uid_transactions = campaign_sheet_report.get('unmatched_uid_transactions', [])
+                if uid_conflicts or unmatched_uid_transactions:
+                    self.log_manage("\n【广告系列UID冲突报告】")
+                    if uid_conflicts:
+                        total_conflict_commission = sum(item.get('commission', 0.0) for item in uid_conflicts)
+                        conflict_uids = {item.get('uid', '') for item in uid_conflicts if item.get('uid', '')}
+                        conflict_campaign_keys = set()
+                        for item in uid_conflicts:
+                            for campaign in item.get('campaigns', []):
+                                conflict_campaign_keys.add(
+                                    (campaign.get('row_index', ''), campaign.get('campaign_name', ''))
+                                )
+                        self.log_manage(
+                            f"  UID冲突: {len(conflict_uids)} 个UID，涉及 {len(conflict_campaign_keys)} 个广告系列，冲突佣金合计 ${total_conflict_commission:.2f}"
+                        )
+                        for item in uid_conflicts:
+                            self.log_manage(
+                                f"    - UID={item.get('uid', '')}, 佣金=${item.get('commission', 0.0):.2f}, "
+                                f"ASIN={item.get('asin', '')}, 国家={item.get('country', '')}, "
+                                f"关联广告系列={len(item.get('campaigns', []))} 个"
+                            )
+                            for campaign in item.get('campaigns', []):
+                                self.log_manage(
+                                    f"      row={campaign.get('row_index', '')}, 广告系列={campaign.get('campaign_name', '')}, 状态={campaign.get('status', '')}"
+                                )
+                    if unmatched_uid_transactions:
+                        total_unmatched_commission = sum(item.get('commission', 0.0) for item in unmatched_uid_transactions)
+                        self.log_manage(
+                            f"  UID未匹配到广告系列: {len(unmatched_uid_transactions)} 条佣金，金额合计 ${total_unmatched_commission:.2f}"
+                        )
+                        for item in unmatched_uid_transactions:
+                            self.log_manage(
+                                f"    - UID={item.get('uid', '')}, 佣金=${item.get('commission', 0.0):.2f}, "
+                                f"ASIN={item.get('asin', '')}, 国家={item.get('country', '')}, 原因={item.get('reason', '')}"
+                            )
             
             self.log_manage("\n" + "=" * 50)
             self.log_manage("✅ 统计完成！")
@@ -2975,7 +3213,7 @@ class OfferToolApp:
         finally:
             self.root.after(0, self._restore_manage_ui)
     
-    def update_campaigns_sheet(self, feishu_token, campaign_data, commission_data, feishu_data, campaign_id_to_tracking_link=None):
+    def update_campaigns_sheet(self, feishu_token, campaign_data, commission_data, feishu_data, campaign_id_to_tracking_link=None, offer_commission_context=None):
         """更新'广告系列'表格
         
         Args:
@@ -2983,10 +3221,15 @@ class OfferToolApp:
             campaign_data: Google Ads广告系列数据列表
             commission_data: PB佣金数据列表
             feishu_data: offer表格数据（用于获取广告系列名称-投放链接映射）
+            offer_commission_context: offer行级佣金归因结果，确保广告系列与offer使用同口径
         """
         # 新表格的配置
         campaigns_spreadsheet_token = "KnJ1wphpBiVMrGkWl5ncUkMGnfe"
         campaigns_sheet_id = "XrkOF7"
+        report = {
+            'uid_conflicts': [],
+            'unmatched_uid_transactions': [],
+        }
         
         # 步骤1：从offer表格构建 (ASIN, 国家) -> 投放链接 和 每单佣金 的映射
         self.log_manage("  构建(ASIN+国家)到投放链接和每单佣金的映射...")
@@ -3006,7 +3249,7 @@ class OfferToolApp:
             commission_rate = row.get('佣金', '')
             
             if asin and country:
-                key = (asin, country.upper())
+                key = (asin, self.normalize_country_code(country))
                 if tracking_link:
                     rows_with_tracking_link += 1
                     if key not in asin_country_to_tracking_links:
@@ -3044,36 +3287,16 @@ class OfferToolApp:
         for key, links in list(asin_country_to_tracking_links.items())[:20]:
             self.log_debug(f"  {key[0]}_{key[1]} -> {len(links)}个链接")
         
-        # 步骤2：构建 uid -> 佣金数据 的映射（只处理带uid的佣金）
-        self.log_manage("  构建UID到佣金数据的映射...")
-        uid_commission = {}  # {uid: {'total_commission': float, 'asins': set()}}
-        
-        for trans in commission_data:
-            if trans.get('status') == 'Rejected':
-                continue
-            
-            uid = trans.get('uid', '')
-            if uid:  # 只处理带uid的佣金
-                comm = float(trans.get('sale_comm', 0) or 0)
-                asin = trans.get('prod_id', '')
-                
-                # 获取国家代码
-                country = trans.get('customer_country', '') or trans.get('geo', '') or trans.get('country', '')
-                if not country:
-                    merchant_name = trans.get('merchant_name', '')
-                    if merchant_name:
-                        country = self.extract_country_from_merchant_name(merchant_name)
-                if not country:
-                    country = 'US'
-                country = country.upper()
-                
-                if uid not in uid_commission:
-                    uid_commission[uid] = {'total_commission': 0, 'asins': set()}
-                uid_commission[uid]['total_commission'] += comm
-                if asin:
-                    uid_commission[uid]['asins'].add(f"{asin}_{country}")
-        
-        self.log_manage(f"    找到 {len(uid_commission)} 个带UID的佣金记录")
+        if offer_commission_context is None:
+            offer_commission_context = {}
+
+        def normalize_link_value(value):
+            if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+                return value[0].get('link', '') or value[0].get('text', '')
+            return value if isinstance(value, str) else ''
+
+        def normalize_country_value(value):
+            return self.normalize_country_code(value)
         
         # 步骤3：构建MCC中所有广告系列的信息
         self.log_manage("  处理MCC广告系列数据...")
@@ -3139,6 +3362,32 @@ class OfferToolApp:
                 existing_campaign_commission[name] = self.parse_commission_value(row_data.get('总佣金', ''))
                 # 记录上次的状态（用于检测状态变更）
                 existing_campaign_status[name] = str(row_data.get('状态', '') or '').strip()
+
+        existing_campaign_row_info = {}
+        for row_data in existing_rows:
+            name = row_data.get('广告系列名称', '')
+            row_idx = row_data.get('row_index')
+            if name and row_idx:
+                existing_campaign_row_info[name] = {
+                    'row_index': row_idx,
+                    'campaign_name': name,
+                    'status': str(row_data.get('状态', '') or '').strip(),
+                }
+
+        def extract_tracking_uid(link):
+            link = normalize_link_value(link)
+            if not link:
+                return ''
+            uid_match = re.search(r'[?&]uid=([^&]+)', link)
+            if uid_match:
+                return uid_match.group(1)
+            return link[-7:] if len(link) >= 7 else link
+
+        current_campaign_id_to_name = {}
+        for campaign_name, campaign_info in mcc_campaigns.items():
+            campaign_id = str(campaign_info.get('campaign_id', '') or '').strip()
+            if campaign_id:
+                current_campaign_id_to_name[campaign_id] = campaign_name
         
         # 调试日志
         self.log_debug(f"广告系列表格列映射: {column_map}")
@@ -3153,6 +3402,108 @@ class OfferToolApp:
         self.log_manage("  准备更新数据...")
         updates = []  # 更新现有行
         new_rows = []  # 新增行
+        preserved_campaign_cost_rows = []
+
+        # 基于uid构建广告系列佣金映射
+        campaign_commission_totals = {}  # {campaign_name: float}
+        campaign_commission_asins = {}   # {campaign_name: set()}
+        unmatched_uid_commission_total = 0.0
+        unmatched_uid_commission_count = 0
+
+        uid_to_unique_campaign = {}
+        ambiguous_uid_to_campaigns = {}
+        uid_conflict_details = {}
+
+        def remember_uid_campaign(uid, campaign_name, status=''):
+            if not uid or not campaign_name:
+                return
+            ambiguous_uid_to_campaigns.setdefault(uid, set()).add(campaign_name)
+            uid_conflict_details.setdefault(uid, {})
+            if campaign_name not in uid_conflict_details[uid]:
+                row_info = existing_campaign_row_info.get(campaign_name, {})
+                uid_conflict_details[uid][campaign_name] = {
+                    'row_index': row_info.get('row_index', existing_campaign_names.get(campaign_name, '')),
+                    'campaign_name': campaign_name,
+                    'status': status or row_info.get('status', existing_campaign_status.get(campaign_name, '')),
+                }
+
+        for campaign_id, link in campaign_id_to_tracking_link.items():
+            uid = extract_tracking_uid(link)
+            campaign_name = current_campaign_id_to_name.get(str(campaign_id).strip())
+            if uid and campaign_name and campaign_name in mcc_campaigns:
+                remember_uid_campaign(uid, campaign_name, mcc_campaigns.get(campaign_name, {}).get('status', ''))
+
+        for campaign_name, link in existing_campaign_links.items():
+            uid = extract_tracking_uid(link)
+            if uid and campaign_name:
+                remember_uid_campaign(uid, campaign_name, existing_campaign_status.get(campaign_name, ''))
+
+        for uid, campaign_names in ambiguous_uid_to_campaigns.items():
+            if len(campaign_names) == 1:
+                uid_to_unique_campaign[uid] = next(iter(campaign_names))
+
+        for trans in commission_data:
+            if trans.get('status') == 'Rejected':
+                continue
+            uid = str(trans.get('uid', '') or '').strip()
+            if not uid:
+                continue
+
+            campaign_name = uid_to_unique_campaign.get(uid)
+            comm = float(trans.get('sale_comm', 0) or 0)
+            asin = str(trans.get('prod_id', '') or '').strip()
+            country = normalize_country_value(
+                trans.get('customer_country', '') or trans.get('geo', '') or trans.get('country', '')
+            )
+            if not country and trans.get('merchant_name', ''):
+                country = normalize_country_value(self.extract_country_from_merchant_name(trans.get('merchant_name', '')))
+            if not country and trans.get('mcid', ''):
+                country = normalize_country_value(self.extract_country_from_mcid(trans.get('mcid', '')))
+            if not country:
+                country = 'US'
+
+            if campaign_name:
+                campaign_commission_totals[campaign_name] = campaign_commission_totals.get(campaign_name, 0.0) + comm
+                if campaign_name not in campaign_commission_asins:
+                    campaign_commission_asins[campaign_name] = set()
+                if asin:
+                    campaign_commission_asins[campaign_name].add(f"{asin}_{country}")
+            else:
+                unmatched_uid_commission_total += comm
+                unmatched_uid_commission_count += 1
+                related_campaigns = []
+                for related in sorted(uid_conflict_details.get(uid, {}).values(), key=lambda item: (item.get('row_index') or 10**9, item.get('campaign_name', ''))):
+                    related_campaigns.append({
+                        'row_index': related.get('row_index', ''),
+                        'campaign_name': related.get('campaign_name', ''),
+                        'status': related.get('status', ''),
+                    })
+                if related_campaigns:
+                    report['uid_conflicts'].append({
+                        'uid': uid,
+                        'commission': comm,
+                        'asin': asin,
+                        'country': country,
+                        'campaigns': related_campaigns,
+                    })
+                else:
+                    report['unmatched_uid_transactions'].append({
+                        'uid': uid,
+                        'commission': comm,
+                        'asin': asin,
+                        'country': country,
+                        'reason': '广告系列表中未找到该UID',
+                    })
+
+        self.log_manage(
+            f"  基于uid构建广告系列佣金: {len(campaign_commission_totals)} 个广告系列, "
+            f"合计=${sum(campaign_commission_totals.values()):.2f}"
+        )
+        if unmatched_uid_commission_total > 0:
+            self.log_manage(
+                f"    仍无法归到唯一广告系列的uid佣金: {unmatched_uid_commission_count} 条, "
+                f"金额=${unmatched_uid_commission_total:.2f}"
+            )
         
         # 用于追踪每个(ASIN+国家)已分配的投放链接索引，确保不同campaign获得不同链接
         key_link_assigned_idx = {}  # {(asin, country): next_index}
@@ -3167,7 +3518,7 @@ class OfferToolApp:
             campaign_id = campaign_info.get('campaign_id', '')
             
             if asin and country:
-                key = (asin, country.upper())
+                key = (asin, self.normalize_country_code(country))
                 
                 # 优先使用精确映射（基于offer表的link_id匹配结果）
                 if campaign_id and campaign_id in campaign_id_to_tracking_link:
@@ -3194,25 +3545,16 @@ class OfferToolApp:
                     else:
                         commission_per_order = str(commission_per_order_value)
             
-            # 通过投放链接最后7位匹配UID获取佣金
-            total_commission = 0
-            commission_asins = set()
-            
-            if tracking_link:
-                # 提取投放链接最后7位作为UID
-                link_uid = tracking_link[-7:] if len(tracking_link) >= 7 else tracking_link
-                if link_uid in uid_commission:
-                    total_commission = uid_commission[link_uid]['total_commission']
-                    commission_asins = uid_commission[link_uid]['asins']
-                    self.log_debug(f"  广告系列UID匹配成功: {campaign_name} | UID={link_uid} | 佣金=${total_commission:.2f} | ASINs={commission_asins}")
-                else:
-                    self.log_debug(f"  广告系列UID匹配失败: {campaign_name} | UID={link_uid} (佣金数据中无此UID)")
-            else:
-                self.log_debug(f"  广告系列无投放链接: {campaign_name} | ASIN={asin} | 国家={country}")
-            
+            total_commission = round(campaign_commission_totals.get(campaign_name, 0.0), 2)
+            commission_asins = campaign_commission_asins.get(campaign_name, set())
+            if total_commission > 0:
+                self.log_debug(
+                    f"  广告系列佣金按UID归因: {campaign_name} | 佣金=${total_commission:.2f} | "
+                    f"ASINs={sorted(commission_asins)}"
+                )
+
             # 计算ROI
             cost = campaign_info['cost_usd']
-            roi = round(total_commission / cost, 1) if cost > 0 else 0
             
             # 确定状态
             status_raw = campaign_info['status']
@@ -3250,23 +3592,39 @@ class OfferToolApp:
             # 计算新增量（本次值 - 上次值）
             prev_cost = existing_campaign_cost.get(campaign_name, 0)
             prev_commission = existing_campaign_commission.get(campaign_name, 0)
+            preserve_existing_cost = cost <= 0.0001 and prev_cost > 0.0001
             cost_increment = cost - prev_cost
             commission_increment = total_commission - prev_commission
+            roi_cost = prev_cost if preserve_existing_cost else cost
+            roi = round(total_commission / roi_cost, 1) if roi_cost > 0 else 0
+            if preserve_existing_cost:
+                preserved_campaign_cost_rows.append({
+                    'campaign_name': campaign_name,
+                    'previous_cost': prev_cost,
+                    'row_index': existing_campaign_names.get(campaign_name)
+                })
             
+            # 未拿到新链接时，优先保留广告系列表里已有的投放链接，避免空值覆盖
+            tracking_link_to_write = tracking_link or existing_campaign_links.get(campaign_name) or None
+            if not tracking_link and tracking_link_to_write:
+                self.log_debug(
+                    f"  保留已有投放链接: {campaign_name} | campaign_id={campaign_id or 'None'}"
+                )
+
             # 准备更新数据
             update_data = {
                 'campaign_name': campaign_name,
                 '状态': status,
                 '广告系列名称': campaign_name,
                 '投放中的ads': campaign_info['account_id'].replace('-', ''),
-                '投放链接': tracking_link,
-                '广告系列总花费': f"${cost:.2f}",
+                '投放链接': tracking_link_to_write,
+                '广告系列总花费': None if preserve_existing_cost else f"${cost:.2f}",
                 '总佣金': f"${total_commission:.2f}",
                 'ROI': f"{roi}",
                 '佣金ASIN': asins_str,
                 '每单佣金': commission_per_order,
                 '产品链接': product_link_url,
-                '新增广告系列花费': f"${cost_increment:.2f}",
+                '新增广告系列花费': None if preserve_existing_cost else f"${cost_increment:.2f}",
                 '新增佣金': f"${commission_increment:.2f}",
                 'status_color': status_color
             }
@@ -3279,13 +3637,31 @@ class OfferToolApp:
                 # 新增行（上次不存在，新增量就是本次的全部值）
                 new_rows.append(update_data)
         
+        if preserved_campaign_cost_rows:
+            self.log_manage(
+                f"    花费保护: 广告系列表保留 {len(preserved_campaign_cost_rows)} 行原花费，避免本次$0.00覆盖"
+            )
+            for item in preserved_campaign_cost_rows[:3]:
+                self.log_manage(
+                    f"      - row={item['row_index']}, 广告系列={item['campaign_name']}, "
+                    f"保留原花费=${item['previous_cost']:.2f}"
+                )
+            if len(preserved_campaign_cost_rows) > 3:
+                self.log_manage(f"      ... 还有 {len(preserved_campaign_cost_rows) - 3} 行未显示")
+
         # 处理已删除的广告系列（在表格中存在但MCC中不存在）
         for campaign_name, row_idx in existing_campaign_names.items():
             if campaign_name not in mcc_campaigns:
+                ended_commission = round(campaign_commission_totals.get(campaign_name, 0.0), 2)
+                ended_asins = ', '.join(sorted(campaign_commission_asins.get(campaign_name, set())))
+                prev_commission = existing_campaign_commission.get(campaign_name, 0.0)
                 updates.append({
                     'campaign_name': campaign_name,
                     'row_index': row_idx,
                     '状态': '投放已结束',
+                    '总佣金': f"${ended_commission:.2f}",
+                    '佣金ASIN': ended_asins,
+                    '新增佣金': f"${ended_commission - prev_commission:.2f}",
                     'status_color': 'black'
                 })
         
@@ -3304,6 +3680,8 @@ class OfferToolApp:
             )
         else:
             self.log_manage("  没有需要更新的内容")
+        
+        return report
     
     def read_campaigns_sheet(self, token, spreadsheet_token, sheet_id):
         """读取广告系列表格数据
@@ -3412,6 +3790,8 @@ class OfferToolApp:
             
             for field, col in field_to_column.items():
                 if field in update and update[field] is not None:
+                    if field == '投放链接' and str(update[field]).strip() == '':
+                        continue
                     value_ranges.append({
                         'range': f"{sheet_id}!{col}{row_idx}:{col}{row_idx}",
                         'values': [[update[field]]]
@@ -3430,6 +3810,8 @@ class OfferToolApp:
         for new_row in new_rows:
             for field, col in field_to_column.items():
                 if field in new_row and new_row[field] is not None:
+                    if field == '投放链接' and str(new_row[field]).strip() == '':
+                        continue
                     value_ranges.append({
                         'range': f"{sheet_id}!{col}{current_row}:{col}{current_row}",
                         'values': [[new_row[field]]]
@@ -3517,7 +3899,7 @@ class OfferToolApp:
             except Exception as e:
                 self.log_manage(f"    样式更新异常: {str(e)}")
     
-    def get_all_campaigns_with_asin(self):
+    def get_all_campaigns_with_asin(self, start_date_str=None, end_date_str=None):
         """获取所有广告系列及其ASIN（从广告层级的最终到达网址提取）
         
         返回:
@@ -3565,33 +3947,78 @@ class OfferToolApp:
                 try:
                     # 获取账户货币类型
                     account_currency = account.get('currency', 'USD')
-                    
-                    # 查询广告层级，获取最终到达网址和跟踪后缀
+
+                    # 先查询广告系列基础信息，确保所有非REMOVED广告系列都能纳入结果。
+                    campaign_query = """
+                        SELECT
+                            campaign.id,
+                            campaign.name,
+                            campaign.status,
+                            campaign.final_url_suffix
+                        FROM campaign
+                        WHERE campaign.status != 'REMOVED'
+                    """
+                    campaign_response = ga_service.search(customer_id=account['id'], query=campaign_query)
+
+                    campaign_info = {}  # {campaign_id: campaign_data}
+                    for row in campaign_response:
+                        c = row.campaign
+                        campaign_id = str(c.id)
+                        if campaign_id not in campaign_info:
+                            country = self.extract_country_from_campaign_name(c.name)
+                            campaign_info[campaign_id] = {
+                                'account_id': account['id'],
+                                'account_name': account['name'],
+                                'campaign_id': campaign_id,
+                                'campaign_name': c.name,
+                                'status': c.status.name,
+                                'cost_usd': 0,
+                                'currency': account_currency,
+                                'asin': None,
+                                'country': country,
+                                'final_urls': [],
+                                'final_url_suffix': c.final_url_suffix if c.final_url_suffix else '',
+                                'link_ids': set(),
+                                'uids': set()
+                            }
+
+                    # 查询广告层级，获取最终到达网址，补充ASIN / uid / link_id。
                     ad_query = """
                         SELECT
                             campaign.id,
                             campaign.name,
                             campaign.status,
                             campaign.final_url_suffix,
-                            ad_group.id,
-                            ad_group_ad.ad.final_urls,
-                            metrics.cost_micros
+                            ad_group_ad.ad.final_urls
                         FROM ad_group_ad
                         WHERE campaign.status != 'REMOVED'
                             AND ad_group_ad.status != 'REMOVED'
                     """
                     
                     ad_response = ga_service.search(customer_id=account['id'], query=ad_query)
-                    
-                    # 用于去重：每个广告系列只记录一次，但收集所有ASIN
-                    campaign_info = {}  # {campaign_id: campaign_data}
-                    
+
                     for row in ad_response:
                         c = row.campaign
                         ad = row.ad_group_ad.ad
-                        m = row.metrics
-                        
                         campaign_id = str(c.id)
+
+                        if campaign_id not in campaign_info:
+                            country = self.extract_country_from_campaign_name(c.name)
+                            campaign_info[campaign_id] = {
+                                'account_id': account['id'],
+                                'account_name': account['name'],
+                                'campaign_id': campaign_id,
+                                'campaign_name': c.name,
+                                'status': c.status.name,
+                                'cost_usd': 0,
+                                'currency': account_currency,
+                                'asin': None,
+                                'country': country,
+                                'final_urls': [],
+                                'final_url_suffix': c.final_url_suffix if c.final_url_suffix else '',
+                                'link_ids': set(),
+                                'uids': set()
+                            }
                         
                         # 从广告的最终到达网址提取ASIN
                         asin = None
@@ -3622,34 +4049,10 @@ class OfferToolApp:
                                 uid_match = re.search(r'(?:^|&)uid=([^&]+)', suffix)
                                 if uid_match:
                                     ad_uid = uid_match.group(1)
-                        
-                        if campaign_id not in campaign_info:
-                            # 从广告系列名称提取国家代码
-                            country = self.extract_country_from_campaign_name(c.name)
-                            campaign_info[campaign_id] = {
-                                'account_id': account['id'],
-                                'account_name': account['name'],
-                                'campaign_id': campaign_id,
-                                'campaign_name': c.name,
-                                'status': c.status.name,
-                                'cost_usd': 0,
-                                'currency': account_currency,
-                                'asin': asin,
-                                'country': country,
-                                'final_urls': list(ad.final_urls) if ad.final_urls else [],
-                                'final_url_suffix': suffix,
-                                'link_ids': set(),  # 该广告系列关联的所有link_id
-                                'uids': set()       # 该广告系列关联的所有uid
-                            }
-                        
-                        # 累加花费（根据货币类型转换为USD）
-                        cost_in_original = m.cost_micros / 1000000 if m.cost_micros else 0
-                        if account_currency == 'CNY':
-                            cost_in_usd = cost_in_original * CNY_TO_USD_RATE
-                        else:
-                            cost_in_usd = cost_in_original  # 假设其他货币都是USD
-                        campaign_info[campaign_id]['cost_usd'] += cost_in_usd
-                        
+
+                        if not campaign_info[campaign_id]['final_urls'] and ad.final_urls:
+                            campaign_info[campaign_id]['final_urls'] = list(ad.final_urls)
+
                         # 如果之前没有ASIN，尝试从这个广告获取
                         if not campaign_info[campaign_id]['asin'] and asin:
                             campaign_info[campaign_id]['asin'] = asin
@@ -3659,6 +4062,33 @@ class OfferToolApp:
                             campaign_info[campaign_id]['link_ids'].add(ad_link_id)
                         if ad_uid:
                             campaign_info[campaign_id]['uids'].add(ad_uid)
+
+                    # 用统计日期范围在campaign级别汇总花费，避免广告级查询把历史花费漏掉后写成0。
+                    cost_query = """
+                        SELECT
+                            campaign.id,
+                            metrics.cost_micros
+                        FROM campaign
+                        WHERE campaign.status != 'REMOVED'
+                    """
+                    if start_date_str and end_date_str:
+                        cost_query += f"""
+                            AND segments.date >= '{start_date_str}'
+                            AND segments.date <= '{end_date_str}'
+                        """
+
+                    cost_response = ga_service.search(customer_id=account['id'], query=cost_query)
+                    for row in cost_response:
+                        campaign_id = str(row.campaign.id)
+                        if campaign_id not in campaign_info:
+                            continue
+
+                        cost_in_original = row.metrics.cost_micros / 1000000 if row.metrics.cost_micros else 0
+                        if account_currency == 'CNY':
+                            cost_in_usd = cost_in_original * CNY_TO_USD_RATE
+                        else:
+                            cost_in_usd = cost_in_original
+                        campaign_info[campaign_id]['cost_usd'] += cost_in_usd
                     
                     # 将set转为list方便后续处理
                     for cinfo in campaign_info.values():
@@ -3752,7 +4182,7 @@ class OfferToolApp:
         asin_country_rows = {}
         for row in feishu_data:
             asin = row.get('ASIN', '') or ''
-            country = (row.get('国家代码', '') or '').upper().strip()
+            country = self.normalize_country_code(row.get('国家代码', ''))
             if not asin or not country:
                 continue
             key = (asin, country)
@@ -3927,7 +4357,7 @@ class OfferToolApp:
             return None
         
         # 常见国家代码列表
-        country_codes = ['US', 'UK', 'DE', 'FR', 'IT', 'ES', 'CA', 'JP', 'AU', 'NL', 'BE', 'MX', 'BR', 'IN', 'SG', 'AE', 'SA', 'PL', 'SE', 'TR', 'EG']
+        country_codes = ['US', 'UK', 'GB', 'DE', 'FR', 'IT', 'ES', 'CA', 'JP', 'AU', 'NL', 'BE', 'MX', 'BR', 'IN', 'SG', 'AE', 'SA', 'PL', 'SE', 'TR', 'EG']
         
         # 尝试从广告系列名称中匹配国家代码
         # 格式：xxxx-xxxx-brand-COUNTRY-type-date
@@ -4178,7 +4608,7 @@ class OfferToolApp:
             cost_to_add: float, 要累加的花费
             brand_name: str, 品牌名称
         """
-        key = (asin, country.upper())
+        key = (asin, self.normalize_country_code(country))
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         if key in old_consume_data:
@@ -4267,21 +4697,21 @@ class OfferToolApp:
         except Exception as e:
             self.log_manage(f"  保存广告系列快照文件失败: {e}")
     
-    def get_all_commissions(self):
-        """获取所有历史佣金数据"""
+    def get_all_commissions(self, start_date_str, end_date_str):
+        """获取指定日期范围内的佣金数据"""
         all_transactions = []
         url = f"{PB_API_BASE_URL}/api.php?mod=medium&op=transaction"
         token = self.pb_token_var.get().strip()
         
-        start_from = datetime(2024, 1, 1)
-        current_end = datetime.now()
+        start_from = datetime.strptime(start_date_str, '%Y-%m-%d')
+        current_end = datetime.strptime(end_date_str, '%Y-%m-%d')
         
-        self.log_manage(f"  查询佣金数据，日期范围: {start_from.strftime('%Y-%m-%d')} 到 {current_end.strftime('%Y-%m-%d')}")
+        self.log_manage(f"  查询佣金数据，日期范围: {start_date_str} 到 {end_date_str}")
         
         api_calls = 0
         api_errors = 0
         
-        while current_end > start_from:
+        while current_end >= start_from:
             if self.stop_flag:
                 break
             
@@ -4293,6 +4723,10 @@ class OfferToolApp:
             end_str = current_end.strftime('%Y-%m-%d')
             
             page = 1
+            chunk_actual_count = 0
+            chunk_api_total_count = None
+            chunk_api_total_page = None
+            chunk_response_pages = 0
             while True:
                 body = {
                     'token': token,
@@ -4319,10 +4753,13 @@ class OfferToolApp:
                     transactions = data.get('data', {}).get('list', [])
                     total_page = int(data.get('data', {}).get('total_page', 0))
                     total_count = int(data.get('data', {}).get('total_count', 0))
-                    
-                    if page == 1 and transactions:
-                        self.log_manage(f"  {begin_str}~{end_str}: 共{total_count}条，{total_page}页")
-                    
+
+                    if page == 1:
+                        chunk_api_total_count = total_count
+                        chunk_api_total_page = total_page if total_page > 0 else 1
+
+                    chunk_actual_count += len(transactions)
+                    chunk_response_pages += 1
                     all_transactions.extend(transactions)
                     
                     if page >= total_page or not transactions:
@@ -4333,6 +4770,18 @@ class OfferToolApp:
                     self.log_manage(f"  API请求异常 ({begin_str}~{end_str}): {str(e)[:100]}")
                     api_errors += 1
                     break
+
+            if chunk_response_pages > 0:
+                reported_pages = chunk_api_total_page if chunk_api_total_page else chunk_response_pages
+                if chunk_api_total_count is not None and chunk_api_total_count != chunk_actual_count:
+                    self.log_manage(
+                        f"  {begin_str}~{end_str}: API声称共{chunk_api_total_count}条，"
+                        f"{reported_pages}页；实际获取{chunk_actual_count}条"
+                    )
+                else:
+                    self.log_manage(
+                        f"  {begin_str}~{end_str}: 实际获取{chunk_actual_count}条，{reported_pages}页"
+                    )
             
             current_end = current_begin - timedelta(days=1)
         
@@ -4353,7 +4802,9 @@ class OfferToolApp:
             row_campaigns: {row_index: [campaign_info, ...]} 通过uid/link_id精确匹配的行级广告系列映射
         
         返回:
-            updates: 更新列表
+            (updates, commission_context):
+                updates: 更新列表
+                commission_context: offer行级佣金归因结果，供广告系列表复用
         """
         if asin_only_commission is None:
             asin_only_commission = {}
@@ -4364,6 +4815,7 @@ class OfferToolApp:
         if row_campaigns is None:
             row_campaigns = {}
         updates = []
+        offer_row_commissions = {}
         
         # 构建已被link_id精确匹配"认领"的广告系列ID集合
         # 用于在回退到(ASIN+国家)匹配时，排除已认领的广告系列
@@ -4388,8 +4840,25 @@ class OfferToolApp:
         asin_countries = {}  # {asin: set(country1, country2, ...)}
         # 记录哪些ASIN有US offer
         asin_has_us_offer = set()
-        # 记录每行的uid（从投放链接最后7位提取）
+        def normalize_link_value(value):
+            """标准化飞书中的链接单元格为纯字符串链接。"""
+            if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+                return value[0].get('link', '') or value[0].get('text', '')
+            return value if isinstance(value, str) else ''
+
+        def extract_tracking_uid(value):
+            """优先提取链接中的uid参数，缺失时回退到末尾7位。"""
+            link = normalize_link_value(value)
+            if not link:
+                return ''
+            uid_match = re.search(r'[?&]uid=([^&]+)', link)
+            if uid_match:
+                return uid_match.group(1)
+            return link[-7:] if len(link) >= 7 else link
+
+        # 记录每行的uid
         row_uid_map = {}  # {row_index: uid}
+        exact_uid_row_candidates = {}  # {(asin, country, uid): [row_index, ...]}
         # 记录每个(asin, country)有多少个不同的投放链接（用于判断是否有复制的offer）
         asin_country_uids = {}  # {(asin, country): [uid1, uid2, ...]}
         
@@ -4403,14 +4872,8 @@ class OfferToolApp:
             if not asin:
                 continue
             
-            # 提取投放链接的uid（最后7位）
-            row_uid = ''
-            if tracking_link:
-                # 处理URL类型的单元格
-                if isinstance(tracking_link, list) and len(tracking_link) > 0 and isinstance(tracking_link[0], dict):
-                    tracking_link = tracking_link[0].get('link', '') or tracking_link[0].get('text', '')
-                if isinstance(tracking_link, str) and len(tracking_link) >= 7:
-                    row_uid = tracking_link[-7:]
+            # 提取投放链接的uid
+            row_uid = extract_tracking_uid(tracking_link)
             row_uid_map[row_index] = row_uid
             
             # 统计每个ASIN的出现次数
@@ -4420,7 +4883,7 @@ class OfferToolApp:
             
             # 标准化国家代码
             if country:
-                country = country.upper().strip()
+                country = self.normalize_country_code(country)
             
             # 记录每个ASIN有哪些国家
             if country:
@@ -4441,6 +4904,7 @@ class OfferToolApp:
                 asin_country_uids[key] = []
             if row_uid:
                 asin_country_uids[key].append(row_uid)
+                exact_uid_row_candidates.setdefault((asin, country, row_uid), []).append(row_index)
             
             if key not in asin_country_rows:
                 asin_country_rows[key] = {'active_rows': [], 'ended_rows': [], 'untested_rows': []}
@@ -4453,71 +4917,156 @@ class OfferToolApp:
                 # 投放中、广告系列暂停中等活跃状态
                 asin_country_rows[key]['active_rows'].append(row_index)
         
-        # 用于跟踪非uid池的佣金是否已分配给某个(asin, country)的offer
-        asin_country_no_uid_assigned = set()
-        # 用于跟踪ASIN-only备选佣金是否已分配
-        asin_only_commission_assigned = set()
-        
+        # 记录UID精确匹配失败后，回退到(ASIN+国家)的分配情况
+        uid_fallback_events = []
+        unresolved_uid_commissions = []
+        # 记录被0花费保护的offer行，避免本次异常0值覆盖旧值
+        preserved_offer_cost_rows = []
+        precomputed_row_commissions = {}
+
+        def get_fallback_row_for_key(key):
+            rows_info = asin_country_rows.get(key, {})
+            for bucket in ('active_rows', 'ended_rows', 'untested_rows'):
+                bucket_rows = rows_info.get(bucket, [])
+                if bucket_rows:
+                    return bucket_rows[0]
+            return None
+
+        def get_or_create_row_commission(row_index, asin, country):
+            if row_index not in precomputed_row_commissions:
+                precomputed_row_commissions[row_index] = {
+                    'row_index': row_index,
+                    'asin': asin,
+                    'country': country,
+                    'total': 0.0,
+                    'used_asin_only_match': False,
+                    'uid_allocations': [],
+                    'non_uid_commission': 0.0,
+                    'asin_only_commission': 0.0,
+                }
+            return precomputed_row_commissions[row_index]
+
+        for uid_key, commission_value in asin_country_uid_commission.items():
+            asin, country, uid = uid_key
+            exact_rows = exact_uid_row_candidates.get(uid_key, [])
+
+            if len(exact_rows) == 1:
+                target_row = exact_rows[0]
+                result = get_or_create_row_commission(target_row, asin, country)
+                result['total'] += commission_value
+                result['uid_allocations'].append({
+                    'uid': uid,
+                    'commission': commission_value,
+                    'match_type': 'uid_exact'
+                })
+                continue
+
+            fallback_row = get_fallback_row_for_key((asin, country))
+            if fallback_row is not None:
+                result = get_or_create_row_commission(fallback_row, asin, country)
+                result['total'] += commission_value
+                result['uid_allocations'].append({
+                    'uid': uid,
+                    'commission': commission_value,
+                    'match_type': 'asin_country_fallback'
+                })
+                uid_fallback_events.append({
+                    'row_index': fallback_row,
+                    'asin': asin,
+                    'country': country,
+                    'uids': [uid],
+                    'commission': commission_value,
+                    'exact_match_count': len(exact_rows)
+                })
+            else:
+                unresolved_uid_commissions.append((uid_key, commission_value))
+
+        allocated_no_uid_keys = set()
+        for key, commission_value in asin_country_no_uid_commission.items():
+            fallback_row = get_fallback_row_for_key(key)
+            if fallback_row is None:
+                continue
+            result = get_or_create_row_commission(fallback_row, key[0], key[1])
+            result['total'] += commission_value
+            result['non_uid_commission'] += commission_value
+            allocated_no_uid_keys.add(key)
+
+        asin_candidate_keys = {}
+        for key in asin_country_rows.keys():
+            asin_candidate_keys.setdefault(key[0], []).append(key)
+        for asin, commission_value in asin_only_commission.items():
+            if asin in asin_has_us_offer or (asin, 'US') in allocated_no_uid_keys:
+                continue
+            target_key = None
+            target_row = None
+            for key in asin_candidate_keys.get(asin, []):
+                row_index = get_fallback_row_for_key(key)
+                if row_index is not None:
+                    target_key = key
+                    target_row = row_index
+                    break
+            if target_key is None or target_row is None:
+                continue
+            result = get_or_create_row_commission(target_row, target_key[0], target_key[1])
+            result['total'] += commission_value
+            result['asin_only_commission'] += commission_value
+            result['used_asin_only_match'] = True
+
         def get_commission_for_row(asin, country, row_index, is_first_offer):
-            """获取某行的佣金值
-            
-            匹配规则（两个池子互不重叠）：
-            1. UID池：PB交易有uid → 匹配到投放链接末尾uid相同的offer行
-            2. 非UID池：PB交易无uid → 按(ASIN+国家)匹配，每个(ASIN,国家)只分配一次
-            
-            一行offer可以同时获得UID池和非UID池的佣金（因为它们是不同的PB交易）
-            
-            Args:
-                asin: ASIN
-                country: 国家代码
-                row_index: 行索引
-                is_first_offer: 是否是该(asin, country)的第一个offer（已弃用，保留参数兼容）
-                
-            Returns:
-                (commission_value, used_asin_only_match, should_clear)
-            """
-            key = (asin, country)
-            row_uid = row_uid_map.get(row_index, '')
-            
-            total_for_row = 0
-            used_asin_only_match = False
-            has_any_match = False
-            
-            # === 第1步：UID池匹配 ===
-            # 如果offer行有uid（投放链接最后7位），尝试从UID池匹配
-            if row_uid:
-                uid_key = (asin, country, row_uid)
-                if uid_key in asin_country_uid_commission:
-                    uid_comm = asin_country_uid_commission[uid_key]
-                    total_for_row += uid_comm
-                    has_any_match = True
-                    self.log_debug(f"  UID池匹配: row={row_index}, ASIN={asin}, 国家={country}, UID={row_uid}, 佣金=${uid_comm:.2f}")
-                else:
-                    self.log_debug(f"  UID池未命中: row={row_index}, ASIN={asin}, 国家={country}, UID={row_uid}")
-            
-            # === 第2步：非UID池匹配 ===
-            # PB交易无uid的佣金，按(ASIN+国家)匹配，每个组合只分配给一行offer
-            if key not in asin_country_no_uid_assigned:
-                if key in asin_country_no_uid_commission:
-                    no_uid_comm = asin_country_no_uid_commission[key]
-                    total_for_row += no_uid_comm
-                    asin_country_no_uid_assigned.add(key)
-                    has_any_match = True
-                    self.log_debug(f"  非UID池匹配: row={row_index}, ASIN={asin}, 国家={country}, 佣金=${no_uid_comm:.2f}")
-                elif asin in asin_only_commission and asin not in asin_has_us_offer and asin not in asin_only_commission_assigned:
-                    # ASIN-only备选匹配：PB交易国家默认为US但ASIN在飞书中没有US的offer
-                    asin_only_comm = asin_only_commission[asin]
-                    total_for_row += asin_only_comm
-                    asin_only_commission_assigned.add(asin)
-                    used_asin_only_match = True
-                    has_any_match = True
-                    self.log_debug(f"  ASIN-only备选匹配: row={row_index}, ASIN={asin}, 国家={country}, 佣金=${asin_only_comm:.2f}")
-            
-            if has_any_match:
-                self.log_debug(f"  → row={row_index} 最终佣金=${total_for_row:.2f}")
-                return (total_for_row, used_asin_only_match, False)
-            
-            return (None, False, False)
+            """获取某行的佣金归因结果。"""
+            result = precomputed_row_commissions.get(row_index)
+            if not result:
+                return {
+                    'total': None,
+                    'used_asin_only_match': False,
+                    'uid_allocations': [],
+                    'non_uid_commission': 0.0,
+                    'asin_only_commission': 0.0,
+                }
+
+            return {
+                'total': result['total'],
+                'used_asin_only_match': result['used_asin_only_match'],
+                'uid_allocations': list(result.get('uid_allocations', [])),
+                'non_uid_commission': result.get('non_uid_commission', 0.0) or 0.0,
+                'asin_only_commission': result.get('asin_only_commission', 0.0) or 0.0,
+            }
+
+        def store_offer_row_commission(row_data, asin, country, row_index, commission_result, campaigns=None):
+            """记录offer行级佣金归因结果，供广告系列表复用。"""
+            commission_value = commission_result.get('total')
+            if commission_value is None:
+                return
+
+            campaign_names = []
+            campaign_ids = []
+            for campaign in campaigns or []:
+                campaign_name = campaign.get('campaign_name', '')
+                campaign_id = campaign.get('campaign_id', '')
+                if campaign_name:
+                    campaign_names.append(campaign_name)
+                if campaign_id:
+                    campaign_ids.append(campaign_id)
+
+            # 对于没有当前广告系列匹配的行，保留offer表中原有的广告系列名称作为弱回退线索
+            if not campaign_names:
+                existing_campaign_names = row_data.get('广告系列名称', '')
+                if isinstance(existing_campaign_names, str) and existing_campaign_names.strip():
+                    campaign_names = [name.strip() for name in existing_campaign_names.split(',') if name.strip()]
+
+            offer_row_commissions[row_index] = {
+                'row_index': row_index,
+                'asin': asin,
+                'country': country,
+                'commission': round(commission_value, 2),
+                'tracking_link': normalize_link_value(row_data.get('投放链接', '')),
+                'campaign_names': campaign_names,
+                'campaign_ids': campaign_ids,
+                'uid_allocations': list(commission_result.get('uid_allocations', [])),
+                'non_uid_commission': commission_result.get('non_uid_commission', 0.0) or 0.0,
+                'asin_only_commission': commission_result.get('asin_only_commission', 0.0) or 0.0,
+                'used_asin_only_match': commission_result.get('used_asin_only_match', False),
+            }
         
         # 记录每个(asin, country)已处理的行数，用于判断是否是第一个offer
         asin_country_processed = {}  # {(asin, country): processed_count}
@@ -4543,7 +5092,7 @@ class OfferToolApp:
             
             # 标准化国家代码
             if country:
-                country = country.upper().strip()
+                country = self.normalize_country_code(country)
             
             key = (asin, country) if country else None
             
@@ -4565,8 +5114,10 @@ class OfferToolApp:
                 else:
                     # 没有广告系列，只更新佣金
                     # 使用辅助函数获取佣金
-                    commission_value, used_asin_only_match, _ = get_commission_for_row(asin, country, row_index, is_first_offer)
-                    
+                    commission_result = get_commission_for_row(asin, country, row_index, is_first_offer)
+                    commission_value = commission_result.get('total')
+                    used_asin_only_match = commission_result.get('used_asin_only_match', False)
+
                     if commission_value is not None:
                         commission_display = round(commission_value, 2)
                         if used_asin_only_match and len(asin_countries.get(asin, set())) > 1:
@@ -4579,6 +5130,7 @@ class OfferToolApp:
                             'commission': commission_display
                         }
                         updates.append(update)
+                        store_offer_row_commission(row, asin, country, row_index, commission_result, [])
                     # 没有广告系列，跳过其他处理
                     continue
             
@@ -4591,8 +5143,10 @@ class OfferToolApp:
                 else:
                     # 没有广告系列，检查是否需要更新佣金
                     # 使用辅助函数获取佣金
-                    commission_value, used_asin_only_match, _ = get_commission_for_row(asin, country, row_index, is_first_offer)
-                    
+                    commission_result = get_commission_for_row(asin, country, row_index, is_first_offer)
+                    commission_value = commission_result.get('total')
+                    used_asin_only_match = commission_result.get('used_asin_only_match', False)
+
                     if commission_value is not None:
                         commission_display = round(commission_value, 2)
                         if used_asin_only_match and len(asin_countries.get(asin, set())) > 1:
@@ -4605,6 +5159,7 @@ class OfferToolApp:
                             'commission': commission_display
                         }
                         updates.append(update)
+                        store_offer_row_commission(row, asin, country, row_index, commission_result, [])
                     # 跳过其他处理（未测试且没有广告系列，不更新状态等）
                     continue
             
@@ -4634,6 +5189,7 @@ class OfferToolApp:
                 
                 # 计算当前广告系列的花费（从Google Ads获取，即全部花费）
                 total_cost = sum(c['cost_usd'] for c in campaigns)
+                previous_total_cost = self.parse_commission_value(row.get('广告系列总花费', ''))
                 
                 # 获取所有账户ID（去除横杠）
                 account_ids = list(set(c['account_id'].replace('-', '') for c in campaigns))
@@ -4657,7 +5213,16 @@ class OfferToolApp:
                 
                 update['ads_ids'] = ','.join(account_ids)
                 update['campaign_count'] = total_campaigns
-                update['total_cost'] = round(total_cost, 2)
+                if total_cost <= 0.0001 and previous_total_cost > 0:
+                    update['total_cost'] = None
+                    preserved_offer_cost_rows.append({
+                        'row_index': row_index,
+                        'asin': asin,
+                        'country': country,
+                        'previous_cost': previous_total_cost,
+                    })
+                else:
+                    update['total_cost'] = round(total_cost, 2)
                 # 多个广告系列名称用逗号分隔
                 update['campaign_names'] = ', '.join(campaign_names)
                 
@@ -4677,17 +5242,62 @@ class OfferToolApp:
             
             # 添加佣金数据 - 非"投放已结束"状态的行
             # 使用辅助函数获取佣金
-            commission_value, used_asin_only_match, _ = get_commission_for_row(asin, country, row_index, is_first_offer)
-            
+            commission_result = get_commission_for_row(asin, country, row_index, is_first_offer)
+            commission_value = commission_result.get('total')
+            used_asin_only_match = commission_result.get('used_asin_only_match', False)
+
             if commission_value is not None:
                 commission_display = round(commission_value, 2)
                 if used_asin_only_match and len(asin_countries.get(asin, set())) > 1:
                     commission_display = f"{commission_display}*"
                 update['commission'] = commission_display
-            
+                store_offer_row_commission(row, asin, country, row_index, commission_result, campaigns)
+
             updates.append(update)
         
-        return updates
+        if uid_fallback_events:
+            fallback_total = sum(item['commission'] for item in uid_fallback_events)
+            self.log_manage(
+                f"  UID未精确命中，已按ASIN+国家回退到Offer: {len(uid_fallback_events)} 行，佣金 ${fallback_total:.2f}"
+            )
+            for item in uid_fallback_events[:3]:
+                self.log_manage(
+                    f"    - row={item['row_index']}, ASIN={item['asin']}, 国家={item['country']}, "
+                    f"UIDs={','.join(item['uids'])}, 佣金=${item['commission']:.2f}"
+                )
+            if len(uid_fallback_events) > 3:
+                self.log_manage(f"    ... 还有 {len(uid_fallback_events) - 3} 行未显示")
+        
+        if unresolved_uid_commissions:
+            unresolved_total = sum(comm for _, comm in unresolved_uid_commissions)
+            self.log_manage(
+                f"  ⚠ 存在 {len(unresolved_uid_commissions)} 条UID佣金未落到具体offer行，金额 ${unresolved_total:.2f}"
+            )
+            for (asin, country, uid), comm in unresolved_uid_commissions[:3]:
+                self.log_manage(
+                    f"    - ASIN={asin}, 国家={country}, UID={uid}, 佣金=${comm:.2f}"
+                )
+            if len(unresolved_uid_commissions) > 3:
+                self.log_manage(f"    ... 还有 {len(unresolved_uid_commissions) - 3} 条未显示")
+
+        if preserved_offer_cost_rows:
+            self.log_manage(
+                f"  花费保护: Offer表保留 {len(preserved_offer_cost_rows)} 行原花费，避免本次$0.00覆盖"
+            )
+            for item in preserved_offer_cost_rows[:3]:
+                self.log_manage(
+                    f"    - row={item['row_index']}, ASIN={item['asin']}, 国家={item['country']}, "
+                    f"保留原花费=${item['previous_cost']:.2f}"
+                )
+            if len(preserved_offer_cost_rows) > 3:
+                self.log_manage(f"    ... 还有 {len(preserved_offer_cost_rows) - 3} 行未显示")
+        
+        commission_context = {
+            'row_commissions': offer_row_commissions,
+            'uid_fallback_events': uid_fallback_events,
+            'unresolved_uid_commissions': unresolved_uid_commissions,
+        }
+        return updates, commission_context
     
     def apply_feishu_updates(self, token, updates):
         """应用飞书表格更新"""
@@ -4889,8 +5499,8 @@ class OfferToolApp:
         """更新单个单元格样式（字体颜色+加粗）- 兼容旧接口"""
         self.batch_update_cell_styles(token, spreadsheet_token, sheet_id, [{'row_index': row_index, 'color': color, 'column': column}])
     
-    def get_mcc_total_cost(self):
-        """从MCC获取所有子账户从2026-01-01至今的总花费（含已删除广告系列），转为USD"""
+    def get_mcc_total_cost(self, start_date_str, end_date_str):
+        """从MCC获取所有子账户在指定日期范围内的总花费（含已删除广告系列），转为USD"""
         try:
             client = self.get_google_ads_client()
             if not client:
@@ -4917,7 +5527,6 @@ class OfferToolApp:
                     })
             
             CNY_TO_USD_RATE = 0.14
-            today = datetime.now().strftime('%Y-%m-%d')
             total_cost_usd = 0
             
             for account in sub_accounts:
@@ -4926,12 +5535,12 @@ class OfferToolApp:
                 try:
                     account_currency = account.get('currency', 'USD')
                     
-                    # 查询该账户从2026-01-01至今的总花费（包含所有广告系列，含已删除的）
+                    # 查询该账户在指定日期范围内的总花费（包含所有广告系列，含已删除的）
                     cost_query = f"""
                         SELECT metrics.cost_micros
                         FROM customer
-                        WHERE segments.date >= '2026-01-01'
-                            AND segments.date <= '{today}'
+                        WHERE segments.date >= '{start_date_str}'
+                            AND segments.date <= '{end_date_str}'
                     """
                     cost_response = ga_service.search(customer_id=account['id'], query=cost_query)
                     
@@ -4950,15 +5559,116 @@ class OfferToolApp:
         except Exception as e:
             self.log_manage(f"  获取MCC总花费失败: {e}")
             return None
+
+    def get_mcc_daily_costs(self, start_date_str, end_date_str):
+        """获取MCC在指定日期范围内的每日花费（含已删除广告系列），转为USD"""
+        daily_costs = {}
+        try:
+            client = self.get_google_ads_client()
+            if not client:
+                self.log_manage("  ✗ 无法创建Google Ads客户端")
+                return daily_costs
+
+            ga_service = client.get_service('GoogleAdsService')
+            mcc_id = self.google_mcc_id_var.get().strip()
+
+            query = """
+                SELECT customer_client.id, customer_client.manager, customer_client.currency_code
+                FROM customer_client
+                WHERE customer_client.level <= 1
+            """
+            response = ga_service.search(customer_id=mcc_id, query=query)
+
+            sub_accounts = []
+            for row in response:
+                if not row.customer_client.manager:
+                    sub_accounts.append({
+                        'id': str(row.customer_client.id),
+                        'currency': row.customer_client.currency_code
+                    })
+
+            CNY_TO_USD_RATE = 0.14
+
+            for account in sub_accounts:
+                if self.stop_flag:
+                    break
+                try:
+                    account_currency = account.get('currency', 'USD')
+                    cost_query = f"""
+                        SELECT segments.date, metrics.cost_micros
+                        FROM customer
+                        WHERE segments.date >= '{start_date_str}'
+                            AND segments.date <= '{end_date_str}'
+                    """
+                    cost_response = ga_service.search(customer_id=account['id'], query=cost_query)
+
+                    for row in cost_response:
+                        day = str(row.segments.date)
+                        cost_original = row.metrics.cost_micros / 1000000 if row.metrics.cost_micros else 0
+                        cost_usd = cost_original * CNY_TO_USD_RATE if account_currency == 'CNY' else cost_original
+                        daily_costs[day] = daily_costs.get(day, 0) + cost_usd
+
+                except Exception as e:
+                    self.log_manage(f"  ⚠ 获取账户 {account['id']} 每日花费失败: {str(e)[:80]}")
+
+        except Exception as e:
+            self.log_manage(f"  获取MCC每日花费失败: {e}")
+
+        return daily_costs
+
+    def get_recent_daily_changes(self, days):
+        """获取最近N天（包含今天）的每日新增花费/佣金/利润"""
+        today = datetime.now().date()
+        end_date = today
+        start_date = today - timedelta(days=days - 1)
+
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        end_date_str = end_date.strftime('%Y-%m-%d')
+
+        self.log_manage(f"  统计最近{days}天新增数据: {start_date_str} 至 {end_date_str}")
+
+        daily_costs = self.get_mcc_daily_costs(start_date_str, end_date_str)
+        commission_data = self.get_all_commissions(start_date_str, end_date_str)
+
+        daily_commissions = {}
+        for trans in commission_data:
+            if trans.get('status') == 'Rejected':
+                continue
+
+            order_time = trans.get('order_time', '')
+            if str(order_time).isdigit():
+                day = datetime.fromtimestamp(int(order_time)).strftime('%Y-%m-%d')
+            else:
+                continue
+
+            comm = float(trans.get('sale_comm', 0) or 0)
+            daily_commissions[day] = daily_commissions.get(day, 0) + comm
+
+        results = []
+        current = start_date
+        while current <= end_date:
+            day = current.strftime('%Y-%m-%d')
+            cost = daily_costs.get(day, 0)
+            commission = daily_commissions.get(day, 0)
+            profit = commission - cost
+            results.append({
+                'date': day,
+                'cost': cost,
+                'commission': commission,
+                'profit': profit
+            })
+            current += timedelta(days=1)
+
+        return results
     
-    def update_feishu_summary_row(self, token, total_commission, total_cost, unmatched_commission=0, rejected_commission=0):
+    def update_feishu_summary_row(self, token, non_rejected_commission, total_cost, gross_commission=0, rejected_commission=0):
         """更新飞书表格第二行'总计'行的汇总数据
         
         参数:
             token: 飞书访问令牌
-            total_commission: 已匹配的总佣金
+            non_rejected_commission: 非Rejected佣金
             total_cost: 总花费
-            unmatched_commission: 未匹配的佣金（找不到对应offer的）
+            gross_commission: 总佣金（含Rejected）
             rejected_commission: Rejected状态的佣金
         """
         spreadsheet_token = self.feishu_spreadsheet_var.get().strip()
@@ -4975,11 +5685,10 @@ class OfferToolApp:
         # 准备更新数据
         value_ranges = []
         
-        # 总佣金列 - 格式：$4481.79 (+$133.91-$278.33)
-        # 含义：已匹配佣金 (+未匹配佣金-Rejected佣金)
+        # 总佣金列 - 格式：$非Rejected佣金 ($总佣金-$Rejected佣金)
         if '总佣金' in column_map:
             col = column_map['总佣金']
-            commission_display = f"${total_commission:.2f} (+${unmatched_commission:.2f}-${rejected_commission:.2f})"
+            commission_display = f"${non_rejected_commission:.2f} (${gross_commission:.2f}-${rejected_commission:.2f})"
             value_ranges.append({
                 'range': f"{sheet_id}!{col}2:{col}2",
                 'values': [[commission_display]]
@@ -5011,7 +5720,7 @@ class OfferToolApp:
             if result.get('code') != 0:
                 self.log_manage(f"  更新总计行失败 (code={result.get('code')}): {result.get('msg', 'Unknown error')}")
             else:
-                self.log_manage(f"  ✅ 总计行更新成功: 总佣金=${total_commission:.2f} (+${unmatched_commission:.2f}-${rejected_commission:.2f}), 总花费=${total_cost:.2f}")
+                self.log_manage(f"  ✅ 总计行更新成功: 总佣金=${non_rejected_commission:.2f} (${gross_commission:.2f}-${rejected_commission:.2f}), 总花费=${total_cost:.2f}")
         except Exception as e:
             self.log_manage(f"  更新总计行异常: {e}")
 
