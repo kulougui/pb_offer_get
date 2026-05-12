@@ -20,7 +20,10 @@ from google.oauth2 import service_account
 
 # 硬编码API基础URL
 PB_API_BASE_URL = "https://app.partnerboost.com"
+YP_API_BASE_URL = "https://yeahpromos.com"
 FEISHU_API_BASE_URL = "https://open.feishu.cn/open-apis"
+SUMMARY_STATUS_TEXT = "相同offer统计行"
+SUMMARY_PLACEHOLDER_TEXT = "——" * 10
 
 # 配置文件路径
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -139,6 +142,9 @@ class OfferToolApp:
         default_config = {
             # PartnerBoost配置
             "pb_token": "5wXyGERfQ3rEQTdI",
+            # YeahPromos配置
+            "yp_token": "",
+            "yp_site_id": "",
             # 飞书配置
             "feishu_app_id": "cli_a8517363cf3bd013",
             "feishu_app_secret": "O4Sm3UNHjpykF9OZq3LroblsrCVYyQEp",
@@ -194,6 +200,8 @@ class OfferToolApp:
             key_text = self.google_sa_key_var.get("1.0", tk.END).strip()
             config_to_save = {
                 "pb_token": self.pb_token_var.get().strip(),
+                "yp_token": self.yp_token_var.get().strip(),
+                "yp_site_id": self.yp_site_id_var.get().strip(),
                 "feishu_app_id": self.feishu_app_id_var.get().strip(),
                 "feishu_app_secret": self.feishu_app_secret_var.get().strip(),
                 "feishu_spreadsheet_token": self.feishu_spreadsheet_var.get().strip(),
@@ -288,9 +296,12 @@ class OfferToolApp:
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(0, 10))
         
-        self.extract_btn = ttk.Button(button_frame, text="提取Offer", command=self.extract_offers)
+        self.extract_btn = ttk.Button(button_frame, text="提取PB Offer", command=self.extract_offers)
         self.extract_btn.pack(side=tk.LEFT, padx=(0, 10))
-        
+
+        self.update_yp_links_btn = ttk.Button(button_frame, text="更新YP链接", command=self.update_yp_links)
+        self.update_yp_links_btn.pack(side=tk.LEFT, padx=(0, 10))
+
         self.copy_offer_btn = ttk.Button(button_frame, text="复制Offer", command=self.copy_offers)
         self.copy_offer_btn.pack(side=tk.LEFT, padx=(0, 10))
         
@@ -417,6 +428,14 @@ class OfferToolApp:
         ttk.Label(pb_frame, text="API Token:", width=20, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=5)
         self.pb_token_var = tk.StringVar(value=self.config.get("pb_token", ""))
         ttk.Entry(pb_frame, textvariable=self.pb_token_var, width=50).grid(row=0, column=1, sticky=tk.W, pady=5)
+
+        ttk.Label(pb_frame, text="YP Token:", width=20, anchor=tk.W).grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.yp_token_var = tk.StringVar(value=self.config.get("yp_token", ""))
+        ttk.Entry(pb_frame, textvariable=self.yp_token_var, width=50).grid(row=1, column=1, sticky=tk.W, pady=5)
+
+        ttk.Label(pb_frame, text="YP Site ID:", width=20, anchor=tk.W).grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.yp_site_id_var = tk.StringVar(value=self.config.get("yp_site_id", ""))
+        ttk.Entry(pb_frame, textvariable=self.yp_site_id_var, width=50).grid(row=2, column=1, sticky=tk.W, pady=5)
         
         # 飞书配置
         feishu_frame = ttk.LabelFrame(main_frame, text="飞书配置", padding="10")
@@ -579,7 +598,7 @@ class OfferToolApp:
                         used_uids.add(uid)
         
         # 生成不重复的UID
-        alphabet = string.ascii_letters + string.digits
+        alphabet = string.ascii_lowercase + string.digits
         max_attempts = 1000
         for _ in range(max_attempts):
             uid = ''.join(secrets.choice(alphabet) for _ in range(7))
@@ -773,11 +792,989 @@ class OfferToolApp:
     
     def _restore_get_ui(self):
         self.extract_btn.config(state='normal')
+        self.update_yp_links_btn.config(state='normal')
         self.copy_offer_btn.config(state='normal')
         self.brand_search_btn.config(state='normal')
         self.progress_get.stop()
         self.update_progress_get("")
-    
+
+    def update_yp_links(self):
+        """为未带tag1的YP投放链接补充随机UID参数名"""
+        if not self.feishu_app_id_var.get().strip() or not self.feishu_app_secret_var.get().strip():
+            messagebox.showerror("错误", "请在API配置中输入飞书App ID和App Secret!")
+            return
+
+        self.extract_btn.config(state='disabled')
+        self.update_yp_links_btn.config(state='disabled')
+        self.copy_offer_btn.config(state='disabled')
+        self.brand_search_btn.config(state='disabled')
+        self.progress_get.start()
+        self.log_text_get.delete(1.0, tk.END)
+
+        thread = threading.Thread(target=self._do_update_yp_links)
+        thread.daemon = True
+        thread.start()
+
+    def _is_yp_tracking_link(self, link):
+        link = str(link or '').strip()
+        return ('https://yeahpromos.com/' in link) or ('https://www.yeahpromos.com/' in link)
+
+    def _yp_link_has_tag1(self, link):
+        link_lower = str(link or '').strip().lower()
+        return '{tag1}' in link_lower or '%7btag1%7d' in link_lower
+
+    def _append_yp_tag1_to_link(self, link, uid):
+        """将YP链接改为 ...&<uid>={tag1} 的格式，并替换已有的YP tag参数。"""
+        link = str(link or '').strip()
+        if not link:
+            return link
+        from urllib.parse import unquote
+
+        if '#' in link:
+            base, fragment = link.split('#', 1)
+            fragment = '#' + fragment
+        else:
+            base, fragment = link, ''
+
+        if '?' in base:
+            prefix, query = base.split('?', 1)
+            raw_parts = [part for part in query.split('&') if part]
+        else:
+            prefix, raw_parts = base, []
+
+        kept_parts = []
+        for part in raw_parts:
+            if '=' in part:
+                key, value = part.split('=', 1)
+            else:
+                key, value = part, ''
+
+            decoded_value = unquote(value).strip().lower()
+            # 替换已有的YP tag1占位参数，或清理历史错误生成的“7位uid=”空参数
+            if decoded_value == '{tag1}':
+                continue
+            if re.fullmatch(r'[a-z0-9]{7}', key, re.IGNORECASE) and value == '':
+                continue
+            kept_parts.append(part)
+
+        kept_parts.append(f"{uid}={{tag1}}")
+        return f"{prefix}?{'&'.join(kept_parts)}{fragment}"
+
+    def extract_tracking_uid_from_link(self, link):
+        """从投放链接提取UID，兼容PB的uid参数和YP的 <uid>={tag1} 格式。"""
+        if isinstance(link, list) and len(link) > 0 and isinstance(link[0], dict):
+            link = link[0].get('link', '') or link[0].get('text', '')
+        link = str(link or '').strip()
+        if not link:
+            return ''
+
+        uid_match = re.search(r'[?&]uid=([^&]+)', link, re.IGNORECASE)
+        if uid_match:
+            uid_value = uid_match.group(1)
+            if uid_value.lower() not in ('{tag1}', '%7btag1%7d'):
+                return uid_value
+
+        yp_match = re.search(r'[?&]([^=&?#]+)=\{tag1\}(?:[&#]|$)', link, re.IGNORECASE)
+        if yp_match:
+            return yp_match.group(1)
+
+        yp_encoded_match = re.search(r'[?&]([^=&?#]+)=%7Btag1%7D(?:[&#]|$)', link, re.IGNORECASE)
+        if yp_encoded_match:
+            return yp_encoded_match.group(1)
+
+        return ''
+
+    def normalize_sheet_cell_value(self, value):
+        """标准化飞书单元格为简单字符串值。"""
+        if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+            return value[0].get('link', '') or value[0].get('text', '')
+        return value if value is not None else ''
+
+    def get_column_index_by_header(self, header):
+        """根据表头名返回0-based列索引。"""
+        col_letter = getattr(self, 'feishu_column_map', {}).get(header)
+        if not col_letter:
+            return None
+        return self.column_letter_to_index(col_letter)
+
+    def column_letter_to_index(self, col_letter):
+        """将列字母转换为0-based列索引。"""
+        if not col_letter:
+            return None
+        index = 0
+        for ch in str(col_letter).strip():
+            if not ('A' <= ch.upper() <= 'Z'):
+                return None
+            index = index * 26 + (ord(ch.upper()) - ord('A') + 1)
+        return index - 1
+
+    def build_offer_row_groups(self, feishu_data):
+        """构建offer表中有效数据行的分组信息。"""
+        asin_country_rows = {}
+        yp_asin_brand_rows = {}
+        row_by_index = {}
+        row_sequence = []
+
+        for row in feishu_data:
+            row_index = row.get('row_index')
+            if not row_index or row_index <= 2:
+                continue
+
+            status = str(row.get('状态', '') or '').strip()
+            asin = str(row.get('ASIN', '') or '').strip()
+            country = self.normalize_country_code(row.get('国家代码', '') or '')
+            brand_id = str(row.get('品牌ID', '') or '').strip()
+            tracking_link = str(self.normalize_sheet_cell_value(row.get('投放链接', '')) or '').strip()
+
+            if not asin or status == SUMMARY_STATUS_TEXT:
+                continue
+
+            row_by_index[row_index] = row
+            row_sequence.append(row_index)
+
+            if country:
+                asin_country_rows.setdefault((asin, country), []).append(row_index)
+
+            if self._is_yp_tracking_link(tracking_link) and brand_id:
+                yp_asin_brand_rows.setdefault((asin, brand_id), []).append(row_index)
+
+        return {
+            'asin_country_rows': asin_country_rows,
+            'yp_asin_brand_rows': yp_asin_brand_rows,
+            'row_by_index': row_by_index,
+            'row_sequence': row_sequence,
+        }
+
+    def build_yp_offer_group_context(self, feishu_data, offer_row_commissions=None):
+        """构建YP offer分组上下文，供广告系列表分组与统计行复用。"""
+        context = {
+            'offer_group_summary_by_key': {},
+            'campaign_name_to_offer_keys': {},
+            'campaign_id_to_offer_keys': {},
+            'tracking_link_to_offer_keys': {},
+        }
+
+        def ensure_group(asin, brand_id, country, brand_name=''):
+            asin = str(asin or '').strip()
+            brand_id = str(brand_id or '').strip()
+            country = self.normalize_country_code(country or '')
+            brand_name = str(brand_name or '').strip()
+            if not asin or not brand_id or not country:
+                return None
+
+            offer_key = (asin, brand_id, country)
+            group_summary = context['offer_group_summary_by_key'].setdefault(offer_key, {
+                'asin': asin,
+                'brand_id': brand_id,
+                'brand_name': brand_name,
+                'country': country,
+                'is_yp': True,
+                'commission': 0.0,
+            })
+            if brand_name and not group_summary.get('brand_name'):
+                group_summary['brand_name'] = brand_name
+            return offer_key, group_summary
+
+        def remember_tracking_link(link, offer_key):
+            normalized_link = str(self.normalize_sheet_cell_value(link) or '').strip()
+            if not normalized_link:
+                return
+            context['tracking_link_to_offer_keys'].setdefault(normalized_link, set()).add(offer_key)
+
+        def remember_campaign_names(campaign_names, offer_key):
+            for campaign_name in campaign_names or []:
+                campaign_name = str(campaign_name or '').strip()
+                if campaign_name:
+                    context['campaign_name_to_offer_keys'].setdefault(campaign_name, set()).add(offer_key)
+
+        for row in feishu_data or []:
+            if str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT:
+                continue
+
+            tracking_link = str(self.normalize_sheet_cell_value(row.get('投放链接', '')) or '').strip()
+            if not self._is_yp_tracking_link(tracking_link):
+                continue
+
+            group_result = ensure_group(
+                row.get('ASIN', ''),
+                row.get('品牌ID', ''),
+                row.get('国家代码', ''),
+                row.get('品牌名称', '')
+            )
+            if not group_result:
+                continue
+
+            offer_key, _ = group_result
+            remember_tracking_link(tracking_link, offer_key)
+            remember_campaign_names(
+                [name.strip() for name in str(row.get('广告系列名称', '') or '').split(',') if name.strip()],
+                offer_key
+            )
+
+        for row_info in (offer_row_commissions or {}).values():
+            if not row_info.get('is_yp'):
+                continue
+
+            group_result = ensure_group(
+                row_info.get('asin', ''),
+                row_info.get('brand_id', ''),
+                row_info.get('country', ''),
+                row_info.get('brand_name', '')
+            )
+            if not group_result:
+                continue
+
+            offer_key, group_summary = group_result
+            group_summary['commission'] += float(row_info.get('commission', 0.0) or 0.0)
+
+            remember_tracking_link(row_info.get('tracking_link', ''), offer_key)
+            remember_campaign_names(row_info.get('campaign_names', []), offer_key)
+            for campaign_id in row_info.get('campaign_ids', []) or []:
+                campaign_id = str(campaign_id or '').strip()
+                if campaign_id:
+                    context['campaign_id_to_offer_keys'].setdefault(campaign_id, set()).add(offer_key)
+
+        return context
+
+    def resolve_yp_campaign_offer_group(self, campaign_name, campaign_info, offer_context, tracking_link=''):
+        """解析YP广告系列所属的offer分组。"""
+        offer_context = offer_context or {}
+        summary_by_key = offer_context.get('offer_group_summary_by_key', {})
+        campaign_name_to_offer_keys = offer_context.get('campaign_name_to_offer_keys', {})
+        campaign_id_to_offer_keys = offer_context.get('campaign_id_to_offer_keys', {})
+        tracking_link_to_offer_keys = offer_context.get('tracking_link_to_offer_keys', {})
+
+        campaign_name = str(campaign_name or '').strip()
+        campaign_info = campaign_info or {}
+        campaign_id = str(campaign_info.get('campaign_id', '') or '').strip()
+        asin = str(campaign_info.get('asin', '') or '').strip()
+        country = self.normalize_country_code(campaign_info.get('country', '') or '')
+
+        candidate_keys = set()
+        if campaign_name:
+            candidate_keys.update(campaign_name_to_offer_keys.get(campaign_name, set()))
+        if campaign_id:
+            candidate_keys.update(campaign_id_to_offer_keys.get(campaign_id, set()))
+
+        normalized_links = []
+        for value in (tracking_link, campaign_info.get('tracking_link', '')):
+            normalized_link = str(self.normalize_sheet_cell_value(value) or '').strip()
+            if normalized_link and normalized_link not in normalized_links:
+                normalized_links.append(normalized_link)
+                candidate_keys.update(tracking_link_to_offer_keys.get(normalized_link, set()))
+
+        has_explicit_yp_signal = bool(candidate_keys) or any(
+            self._is_yp_tracking_link(link) for link in normalized_links
+        )
+
+        if len(candidate_keys) == 1:
+            offer_key = next(iter(candidate_keys))
+            return offer_key, summary_by_key.get(offer_key, {})
+
+        if asin and country and candidate_keys:
+            matched_keys = [key for key in candidate_keys if key[0] == asin and key[2] == country]
+            if len(matched_keys) == 1:
+                offer_key = matched_keys[0]
+                return offer_key, summary_by_key.get(offer_key, {})
+
+        if has_explicit_yp_signal and asin and country:
+            matched_keys = [key for key in summary_by_key.keys() if key[0] == asin and key[2] == country]
+            if len(matched_keys) == 1:
+                offer_key = matched_keys[0]
+                return offer_key, summary_by_key.get(offer_key, {})
+
+        return None, {}
+
+    def summarize_campaign_group_rows(self, row_by_index, row_indices):
+        """汇总广告系列表中同一offer分组的展示数据。"""
+        metrics = {
+            'total_cost': 0.0,
+            'total_commission': 0.0,
+            'total_clicks': 0,
+            'commission_asins': [],
+            'brand_break_even_cpc': '',
+            'increment_cost': 0.0,
+            'increment_commission': 0.0,
+        }
+
+        commission_asin_seen = set()
+        break_even_seen = set()
+
+        for row_index in row_indices or []:
+            row_data = row_by_index.get(row_index, {}) or {}
+            metrics['total_cost'] += self.parse_commission_value(row_data.get('广告系列总花费', ''))
+            metrics['total_commission'] += self.parse_commission_value(row_data.get('总佣金', ''))
+            metrics['total_clicks'] += int(self.parse_commission_value(row_data.get('总点击数', '')) or 0)
+            metrics['increment_cost'] += self.parse_commission_value(row_data.get('新增广告系列花费', ''))
+            metrics['increment_commission'] += self.parse_commission_value(row_data.get('新增佣金', ''))
+
+            commission_asins_value = str(row_data.get('佣金ASIN', '') or '').strip()
+            if commission_asins_value:
+                for asin_item in commission_asins_value.split(','):
+                    asin_item = asin_item.strip()
+                    if asin_item and asin_item not in commission_asin_seen:
+                        commission_asin_seen.add(asin_item)
+                        metrics['commission_asins'].append(asin_item)
+
+            break_even_value = str(row_data.get('品牌收支平衡CPC', '') or '').strip()
+            if break_even_value and break_even_value not in break_even_seen:
+                break_even_seen.add(break_even_value)
+                if not metrics['brand_break_even_cpc']:
+                    metrics['brand_break_even_cpc'] = break_even_value
+
+        return metrics
+
+    def apply_yp_group_commissions_to_campaign_rows(self, updates, new_rows, offer_group_summary_by_key, existing_campaign_commission=None, existing_campaign_cost=None):
+        """把已落到offer分组的YP佣金补写到广告系列行。
+
+        规则：
+        - 若某个YP offer分组只对应 1 个广告系列行，则把该组佣金直接写入该广告系列行。
+        - 若对应多个广告系列行，则佣金保留给后续“相同offer统计行”展示，避免重复落到多个广告系列。
+        """
+        existing_campaign_commission = existing_campaign_commission or {}
+        existing_campaign_cost = existing_campaign_cost or {}
+
+        offer_group_to_rows = {}
+        for item in (updates or []) + (new_rows or []):
+            offer_key = item.get('_offer_group_key')
+            campaign_name = str(item.get('campaign_name', '') or '').strip()
+            if not offer_key or not campaign_name:
+                continue
+            offer_group_to_rows.setdefault(offer_key, [])
+            if item not in offer_group_to_rows[offer_key]:
+                offer_group_to_rows[offer_key].append(item)
+
+        applied_rows = 0
+        skipped_groups = 0
+
+        for offer_key, group_summary in (offer_group_summary_by_key or {}).items():
+            yp_commission = float(group_summary.get('commission', 0.0) or 0.0)
+            if yp_commission <= 0:
+                continue
+
+            targets = offer_group_to_rows.get(offer_key, [])
+            if len(targets) != 1:
+                if len(targets) > 1:
+                    skipped_groups += 1
+                continue
+
+            target = targets[0]
+            campaign_name = str(target.get('campaign_name', '') or '').strip()
+            current_commission = self.parse_commission_value(target.get('总佣金', ''))
+            total_commission = current_commission + yp_commission
+            target['总佣金'] = f"${total_commission:.2f}"
+
+            prev_commission = float(existing_campaign_commission.get(campaign_name, 0.0) or 0.0)
+            target['新增佣金'] = f"${total_commission - prev_commission:.2f}"
+
+            cost_value = self.parse_commission_value(target.get('广告系列总花费', ''))
+            if cost_value <= 0:
+                cost_value = float(existing_campaign_cost.get(campaign_name, 0.0) or 0.0)
+            roi_value = round(total_commission / cost_value, 1) if cost_value > 0 else 0
+            target['ROI'] = f"{roi_value}"
+
+            asin_country_value = f"{offer_key[0]}_{offer_key[2]}"
+            existing_asins = [
+                item.strip() for item in str(target.get('佣金ASIN', '') or '').split(',')
+                if item.strip()
+            ]
+            if asin_country_value not in existing_asins:
+                existing_asins.append(asin_country_value)
+            target['佣金ASIN'] = ', '.join(existing_asins)
+
+            applied_rows += 1
+
+        return {
+            'applied_rows': applied_rows,
+            'skipped_groups': skipped_groups,
+        }
+
+    def build_break_even_brand_country_totals(self, offer_row_commissions, offer_group_summary_by_key, mcc_campaigns, removed_campaign_metrics=None, removed_campaign_sources=None):
+        """按品牌+国家汇总佣金与点击。"""
+        brand_country_totals = {}
+
+        def ensure_aggregate(brand_name, country):
+            brand_name = str(brand_name or '').strip()
+            country = self.normalize_country_code(country or '')
+            if not brand_name or not country:
+                return None
+
+            key = (self.normalize_brand_key(brand_name), country)
+            aggregate = brand_country_totals.setdefault(key, {
+                'brand': brand_name,
+                'country': country,
+                'commission': 0.0,
+                'clicks': 0,
+            })
+            if not aggregate.get('brand'):
+                aggregate['brand'] = brand_name
+            return aggregate
+
+        for row_info in (offer_row_commissions or {}).values():
+            aggregate = ensure_aggregate(
+                row_info.get('brand_name', ''),
+                row_info.get('country', '')
+            )
+            if not aggregate:
+                continue
+            aggregate['commission'] += float(row_info.get('commission', 0.0) or 0.0)
+
+        for campaign_name, campaign_info in (mcc_campaigns or {}).items():
+            brand, country = self.extract_brand_and_country_from_campaign_name(campaign_name)
+            aggregate = ensure_aggregate(brand, country)
+            if not aggregate:
+                continue
+            aggregate['clicks'] += int(campaign_info.get('clicks', 0) or 0)
+
+        for campaign_name, metrics in (removed_campaign_metrics or {}).items():
+            brand, country = self.extract_brand_and_country_from_campaign_name(campaign_name)
+            aggregate = ensure_aggregate(brand, country)
+            if not aggregate:
+                continue
+            aggregate['clicks'] += int(metrics.get('clicks', 0) or 0)
+
+        return brand_country_totals
+
+    def normalize_brand_key(self, brand_name):
+        """标准化品牌名，便于跨来源匹配。"""
+        text = str(brand_name or '').strip()
+        if not text:
+            return ''
+        return re.sub(r'\s+', ' ', text).lower()
+
+    def build_break_even_brand_country_offer_index(self, feishu_data, offer_row_commissions=None):
+        """基于offer表构建品牌+国家映射，供品牌级佣金与点击汇总复用。"""
+        offer_index = {}
+        row_commissions = offer_row_commissions or {}
+        row_by_index = {row.get('row_index'): row for row in (feishu_data or []) if row.get('row_index')}
+
+        def ensure_entry(brand_name, brand_id, country, asin=''):
+            normalized_brand = self.normalize_brand_key(brand_name)
+            normalized_country = self.normalize_country_code(country or '')
+            normalized_brand_id = str(brand_id or '').strip()
+            normalized_asin = str(asin or '').strip().upper()
+            if not normalized_country or (not normalized_brand and not normalized_brand_id):
+                return None
+
+            key = (normalized_brand, normalized_country)
+            entry = offer_index.setdefault(key, {
+                'brand': str(brand_name or '').strip(),
+                'brand_lower': normalized_brand,
+                'country': normalized_country,
+                'brand_ids': set(),
+                'asins': set(),
+            })
+            if brand_name and not entry.get('brand'):
+                entry['brand'] = str(brand_name).strip()
+            if normalized_brand_id:
+                entry['brand_ids'].add(normalized_brand_id)
+            if normalized_asin:
+                entry['asins'].add(normalized_asin)
+            return entry
+
+        for row in (feishu_data or []):
+            if str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT:
+                continue
+            ensure_entry(
+                row.get('品牌名称', ''),
+                row.get('品牌ID', ''),
+                row.get('国家代码', ''),
+                row.get('ASIN', '')
+            )
+
+        for row_info in row_commissions.values():
+            row_data = row_by_index.get(row_info.get('row_index'))
+            brand_name = row_info.get('brand_name', '')
+            brand_id = row_info.get('brand_id', '')
+            country = row_info.get('country', '')
+            asin = row_info.get('asin', '')
+            if row_data:
+                brand_name = brand_name or row_data.get('品牌名称', '')
+                brand_id = brand_id or row_data.get('品牌ID', '')
+                country = country or row_data.get('国家代码', '')
+                asin = asin or row_data.get('ASIN', '')
+            ensure_entry(brand_name, brand_id, country, asin)
+
+        return offer_index
+
+    def build_brand_country_lookup_maps(self, offer_index):
+        """把offer索引拆成多种查找维度。"""
+        lookup = {
+            'by_brand_id_country': {},
+            'by_asin_brand_id_candidates': {},
+            'by_asin_brand_id_country': {},
+            'by_brand_country': {},
+            'by_country_brand': {},
+        }
+
+        for key, entry in (offer_index or {}).items():
+            brand_key, country = key
+            if not country:
+                continue
+            lookup['by_brand_country'][key] = entry
+            if brand_key:
+                lookup['by_country_brand'].setdefault(country, []).append(entry)
+            for brand_id in entry.get('brand_ids', set()):
+                lookup['by_brand_id_country'][(brand_id, country)] = entry
+                for asin in entry.get('asins', set()):
+                    lookup['by_asin_brand_id_candidates'].setdefault((asin, brand_id), [])
+                    if entry not in lookup['by_asin_brand_id_candidates'][(asin, brand_id)]:
+                        lookup['by_asin_brand_id_candidates'][(asin, brand_id)].append(entry)
+                    lookup['by_asin_brand_id_country'][(asin, brand_id, country)] = entry
+
+        return lookup
+
+    def resolve_yp_brand_country_entry(self, trans, offer_lookup):
+        """根据YP交易和offer映射解析品牌+国家归属。"""
+        offer_lookup = offer_lookup or {}
+        by_asin_brand_id_country = offer_lookup.get('by_asin_brand_id_country', {})
+        by_asin_brand_id_candidates = offer_lookup.get('by_asin_brand_id_candidates', {})
+        by_brand_id_country = offer_lookup.get('by_brand_id_country', {})
+        by_country_brand = offer_lookup.get('by_country_brand', {})
+
+        asin = str(trans.get('asin', '') or trans.get('prod_id', '') or '').strip().upper()
+        if not asin:
+            asin = self.extract_asin_from_yp_order_id(trans.get('id', ''))
+        brand_id = str(trans.get('brand_id', '') or trans.get('bid', '') or trans.get('advert_id', '')).strip()
+
+        country_candidates = []
+        for field in ('customer_country', 'geo', 'country', 'country_code'):
+            candidate = self.normalize_country_code(trans.get(field, '') or '')
+            if candidate and candidate not in country_candidates:
+                country_candidates.append(candidate)
+
+        merchant_country = self.normalize_country_code(
+            self.extract_country_from_merchant_name(trans.get('merchant_name', ''))
+        )
+        if merchant_country and merchant_country not in country_candidates:
+            country_candidates.append(merchant_country)
+
+        for country in country_candidates:
+            if asin and brand_id:
+                entry = by_asin_brand_id_country.get((asin, brand_id, country))
+                if entry:
+                    return entry
+            if brand_id:
+                entry = by_brand_id_country.get((brand_id, country))
+                if entry:
+                    return entry
+
+        if asin and brand_id:
+            candidates = by_asin_brand_id_candidates.get((asin, brand_id), [])
+            if len(candidates) == 1:
+                return candidates[0]
+
+        for country in country_candidates:
+            country_entries = by_country_brand.get(country, [])
+            if len(country_entries) == 1:
+                return country_entries[0]
+
+        return None
+
+    def resolve_pb_brand_country_entry(self, trans, offer_lookup):
+        """根据PB交易和offer映射解析品牌+国家归属。"""
+        offer_lookup = offer_lookup or {}
+        by_asin_brand_id_country = offer_lookup.get('by_asin_brand_id_country', {})
+        by_brand_id_country = offer_lookup.get('by_brand_id_country', {})
+        by_asin_brand_id_candidates = offer_lookup.get('by_asin_brand_id_candidates', {})
+        by_brand_country = offer_lookup.get('by_brand_country', {})
+
+        asin = str(trans.get('prod_id', '') or trans.get('asin', '') or '').strip().upper()
+        brand_id = str(trans.get('brand_id', '') or '').strip()
+        merchant_name = str(trans.get('merchant_name', '') or '').strip()
+        parsed_brand_name = ''
+        if merchant_name:
+            parsed_brand_name = str(self._parse_brand_name_country(merchant_name)[0] or '').strip()
+
+        country_candidates = []
+        for field in ('customer_country', 'geo', 'country', 'country_code'):
+            candidate = self.normalize_country_code(trans.get(field, '') or '')
+            if candidate and candidate not in country_candidates:
+                country_candidates.append(candidate)
+
+        merchant_country = self.normalize_country_code(self.extract_country_from_merchant_name(merchant_name))
+        if merchant_country and merchant_country not in country_candidates:
+            country_candidates.append(merchant_country)
+
+        mcid_country = self.normalize_country_code(self.extract_country_from_mcid(trans.get('mcid', '') or ''))
+        if mcid_country and mcid_country not in country_candidates:
+            country_candidates.append(mcid_country)
+
+        if not country_candidates:
+            country_candidates.append('US')
+
+        for country in country_candidates:
+            if asin and brand_id:
+                entry = by_asin_brand_id_country.get((asin, brand_id, country))
+                if entry:
+                    return entry
+            if brand_id:
+                entry = by_brand_id_country.get((brand_id, country))
+                if entry:
+                    return entry
+            if parsed_brand_name:
+                entry = by_brand_country.get((self.normalize_brand_key(parsed_brand_name), country))
+                if entry:
+                    return entry
+
+        if asin and brand_id:
+            candidates = by_asin_brand_id_candidates.get((asin, brand_id), [])
+            if len(candidates) == 1:
+                return candidates[0]
+
+        return None
+
+    def calculate_break_even_brand_country_commissions(self, feishu_data, commission_data=None, yp_commission_data=None):
+        """按品牌+国家汇总统计窗口内 PB+YP 总佣金。"""
+        totals = {}
+        offer_index = self.build_break_even_brand_country_offer_index(feishu_data)
+        offer_lookup = self.build_brand_country_lookup_maps(offer_index)
+
+        def ensure_total(entry):
+            if not entry:
+                return None
+            key = (entry.get('brand_lower', ''), entry.get('country', ''))
+            if not key[0] or not key[1]:
+                return None
+            return totals.setdefault(key, {
+                'brand': entry.get('brand', ''),
+                'country': entry.get('country', ''),
+                'commission': 0.0,
+                'clicks': 0,
+            })
+
+        for trans in (commission_data or []):
+            if str(trans.get('status', '') or '').strip() == 'Rejected':
+                continue
+            entry = self.resolve_pb_brand_country_entry(trans, offer_lookup)
+            aggregate = ensure_total(entry)
+            if not aggregate:
+                continue
+            aggregate['commission'] += float(trans.get('sale_comm', 0.0) or 0.0)
+
+        for trans in (yp_commission_data or []):
+            status = str(trans.get('status', '') or '').strip().lower()
+            if status == 'rejected':
+                continue
+            entry = self.resolve_yp_brand_country_entry(trans, offer_lookup)
+            aggregate = ensure_total(entry)
+            if not aggregate:
+                continue
+            aggregate['commission'] += float(trans.get('sale_comm', 0.0) or 0.0)
+
+        return totals, offer_index
+
+    def campaign_name_matches_brand_country(self, campaign_name, brand_name, country):
+        """判断广告系列名称是否包含品牌名和国家代码。"""
+        name = str(campaign_name or '').strip()
+        brand = str(brand_name or '').strip()
+        normalized_country = self.normalize_country_code(country or '')
+        if not name or not brand or not normalized_country:
+            return False
+
+        tokens = [token.strip().lower() for token in re.split(r'[-_]', name) if token.strip()]
+        brand_tokens = [token.strip().lower() for token in re.split(r'[-_\s]+', brand) if token.strip()]
+        country_upper = normalized_country.upper()
+
+        if country_upper not in {token.upper() for token in tokens}:
+            return False
+        if not brand_tokens:
+            return False
+        return all(token in tokens for token in brand_tokens)
+
+    def get_brand_country_clicks(self, start_date_str, end_date_str, offer_index):
+        """直接调用Google Ads API，汇总名称包含品牌名和国家代码的广告系列点击。"""
+        brand_country_clicks = {
+            key: {
+                'brand': entry.get('brand', ''),
+                'country': entry.get('country', ''),
+                'clicks': 0,
+            }
+            for key, entry in (offer_index or {}).items()
+        }
+        if not brand_country_clicks:
+            return brand_country_clicks
+
+        try:
+            client = self.get_google_ads_client()
+            if not client:
+                self.log_manage("  ✗ 无法创建Google Ads客户端，品牌收支平衡CPC点击数将回退为0")
+                return brand_country_clicks
+
+            ga_service = client.get_service('GoogleAdsService')
+            mcc_id = self.google_mcc_id_var.get().strip()
+            account_query = """
+                SELECT customer_client.id, customer_client.descriptive_name, customer_client.manager
+                FROM customer_client
+                WHERE customer_client.level <= 1
+            """
+            response = ga_service.search(customer_id=mcc_id, query=account_query)
+
+            sub_accounts = []
+            for row in response:
+                if not row.customer_client.manager:
+                    sub_accounts.append({
+                        'id': str(row.customer_client.id),
+                        'name': row.customer_client.descriptive_name,
+                    })
+
+            matched_campaigns = 0
+            for account in sub_accounts:
+                if self.stop_flag:
+                    break
+                try:
+                    query = """
+                        SELECT
+                            campaign.name,
+                            metrics.clicks
+                        FROM campaign
+                        WHERE campaign.name IS NOT NULL
+                    """
+                    if start_date_str and end_date_str:
+                        query += f"""
+                            AND segments.date >= '{start_date_str}'
+                            AND segments.date <= '{end_date_str}'
+                        """
+
+                    campaign_response = ga_service.search(customer_id=account['id'], query=query)
+                    for row in campaign_response:
+                        campaign_name = str(row.campaign.name or '').strip()
+                        if not campaign_name:
+                            continue
+                        clicks = int(row.metrics.clicks or 0)
+                        if clicks <= 0:
+                            continue
+                        for key, entry in brand_country_clicks.items():
+                            if self.campaign_name_matches_brand_country(
+                                campaign_name,
+                                entry.get('brand', ''),
+                                entry.get('country', '')
+                            ):
+                                entry['clicks'] += clicks
+                                matched_campaigns += 1
+                except Exception as e:
+                    self.log_manage(
+                        f"  ⚠ 账户 {account['name']}({account['id']}) 汇总品牌点击失败: {str(e)[:100]}"
+                    )
+
+            self.log_manage(f"  品牌国家点击汇总完成: 匹配到 {matched_campaigns} 个广告系列")
+        except Exception as e:
+            self.log_manage(f"  汇总品牌国家点击失败: {e}")
+
+        return brand_country_clicks
+
+    def apply_brand_break_even_cpc(self, updates, new_rows, mcc_campaigns, brand_country_totals):
+        """把品牌收支平衡CPC写入广告系列更新结果。"""
+        break_even_updates = 0
+
+        def apply_to_rows(rows):
+            nonlocal break_even_updates
+            for item in rows:
+                status = str(item.get('状态', '') or '').strip()
+                if status != '投放中' and not status.startswith('广告系列暂停中'):
+                    continue
+
+                campaign_name = str(item.get('campaign_name', '') or '').strip()
+                brand, country = self.extract_brand_and_country_from_campaign_name(campaign_name)
+                if not brand or not country:
+                    continue
+
+                aggregate = brand_country_totals.get((self.normalize_brand_key(brand), country))
+                if not aggregate:
+                    continue
+
+                total_clicks = int(aggregate.get('clicks', 0) or 0)
+                total_commission = float(aggregate.get('commission', 0.0) or 0.0)
+                break_even_cpc = (total_commission / total_clicks) if total_clicks > 0 else 0.0
+                item['品牌收支平衡CPC'] = f"${break_even_cpc:.2f}"
+                break_even_updates += 1
+
+        apply_to_rows(updates or [])
+        apply_to_rows(new_rows or [])
+        return break_even_updates
+
+    def apply_brand_break_even_cpc_to_ended_rows(self, updates, brand_country_totals):
+        """把品牌收支平衡CPC写入“投放已结束”广告系列更新结果。"""
+        break_even_updates = 0
+
+        for item in updates or []:
+            status = str(item.get('状态', '') or '').strip()
+            if status != '投放已结束':
+                continue
+
+            campaign_name = str(item.get('campaign_name', '') or '').strip()
+            brand, country = self.extract_brand_and_country_from_campaign_name(campaign_name)
+            if not brand or not country:
+                continue
+
+            aggregate = brand_country_totals.get((self.normalize_brand_key(brand), country))
+            if not aggregate:
+                continue
+
+            total_clicks = int(aggregate.get('clicks', 0) or 0)
+            total_commission = float(aggregate.get('commission', 0.0) or 0.0)
+            break_even_cpc = (total_commission / total_clicks) if total_clicks > 0 else 0.0
+            item['品牌收支平衡CPC'] = f"${break_even_cpc:.2f}"
+            break_even_updates += 1
+
+        return break_even_updates
+
+    def extract_asin_from_yp_order_id(self, value):
+        """从YP返回的id字段末尾提取ASIN。"""
+        text = str(value or '').strip()
+        if not text:
+            return ''
+        match = re.search(r'_([A-Z0-9]{10})(?:$|_)', text, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+        return ''
+
+    def _batch_update_sheet_cells(self, token, spreadsheet_token, updates, sheet_id=None):
+        """批量更新飞书单元格值。"""
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        target_sheet_id = sheet_id or self.feishu_sheet_id_var.get().strip()
+
+        value_ranges = []
+        for row_idx, col_idx, value in updates:
+            col_letter = self.index_to_column_letter(col_idx)
+            value_ranges.append({
+                'range': f"{target_sheet_id}!{col_letter}{row_idx}:{col_letter}{row_idx}",
+                'values': [[value]]
+            })
+
+        batch_size = 100
+        success = True
+        for i in range(0, len(value_ranges), batch_size):
+            batch = value_ranges[i:i+batch_size]
+            url = f"{FEISHU_API_BASE_URL}/sheets/v2/spreadsheets/{spreadsheet_token}/values_batch_update"
+            body = {"valueRanges": batch}
+
+            try:
+                response = requests.post(url, headers=headers, json=body, timeout=30)
+                data = response.json()
+                batch_no = i // batch_size + 1
+                if data.get('code') == 0:
+                    self.log_get(f"  批次 {batch_no}: 更新成功 {len(batch)} 个单元格")
+                else:
+                    success = False
+                    self.log_get(f"  批次 {batch_no}: 更新失败 - {data.get('msg', 'Unknown error')}")
+            except Exception as e:
+                success = False
+                self.log_get(f"  批次 {i // batch_size + 1}: 更新异常 - {str(e)}")
+
+        return success
+
+    def insert_sheet_rows(self, token, spreadsheet_token, sheet_id, start_index_0based, count):
+        """在飞书工作表插入空行。"""
+        if count <= 0:
+            return True
+
+        url = f"{FEISHU_API_BASE_URL}/sheets/v2/spreadsheets/{spreadsheet_token}/insert_dimension_range"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        body = {
+            "dimension": {
+                "sheetId": sheet_id,
+                "majorDimension": "ROWS",
+                "startIndex": start_index_0based,
+                "endIndex": start_index_0based + count
+            },
+            "inheritStyle": "BEFORE"
+        }
+        try:
+            response = requests.post(url, headers=headers, json=body, timeout=30)
+            result = response.json()
+            if result.get('code') != 0:
+                self.log_manage(f"    插入行失败: code={result.get('code')}, {result.get('msg', '')}")
+                return False
+            return True
+        except Exception as e:
+            self.log_manage(f"    插入行异常: {e}")
+            return False
+
+    def _do_update_yp_links(self):
+        try:
+            self.log_get("=" * 50)
+            self.log_get("开始更新YP链接...")
+            self.log_get("=" * 50)
+
+            token = self.get_feishu_token()
+            if not token:
+                self.log_get("获取飞书访问令牌失败")
+                return
+
+            spreadsheet_token = self.feishu_spreadsheet_var.get().strip()
+            if not spreadsheet_token or not self.feishu_sheet_id_var.get().strip():
+                self.log_get("飞书电子表格配置缺失")
+                return
+
+            self.log_get("\n【步骤1】读取飞书Offer表格数据...")
+            self.update_progress_get("读取飞书数据...")
+            feishu_data = self.get_feishu_sheet_data(token)
+            tracking_link_col = self.feishu_column_map.get('投放链接')
+            if tracking_link_col is None:
+                self.log_get("未找到“投放链接”列")
+                return
+
+            tracking_link_col_idx = ord(tracking_link_col) - ord('A')
+            yp_rows = []
+            already_tagged = 0
+            empty_link_count = 0
+
+            for row in feishu_data:
+                link = str(row.get('投放链接', '') or '').strip()
+                if not link:
+                    empty_link_count += 1
+                    continue
+                if not self._is_yp_tracking_link(link):
+                    continue
+                if self._yp_link_has_tag1(link):
+                    already_tagged += 1
+                    continue
+                yp_rows.append((row.get('row_index'), link))
+
+            self.log_get(f"  扫描到 {len(feishu_data)} 行Offer")
+            self.log_get(f"  YP链接待更新: {len(yp_rows)} 行")
+            self.log_get(f"  已包含tag1的YP链接: {already_tagged} 行")
+            if empty_link_count:
+                self.log_get(f"  空投放链接: {empty_link_count} 行")
+
+            if not yp_rows:
+                self.log_get("没有需要更新的YP链接")
+                return
+
+            self.log_get("\n【步骤2】生成UID并拼接tag1模板...")
+            self.update_progress_get("生成YP链接...")
+            updates = []
+            for idx, (row_idx, link) in enumerate(yp_rows, start=1):
+                uid = self.generate_random_uid()
+                new_link = self._append_yp_tag1_to_link(link, uid)
+                updates.append((row_idx, tracking_link_col_idx, new_link))
+                self.log_get(f"  第{row_idx}行: uid={uid}")
+                self.root.after(0, lambda i=idx, t=len(yp_rows): self.update_progress_get(f"生成链接 {i}/{t}"))
+
+            self.log_get("\n【步骤3】写回飞书表格...")
+            self.update_progress_get("写入飞书...")
+            self._batch_update_sheet_cells(token, spreadsheet_token, updates)
+
+            self.log_get("\n" + "=" * 50)
+            self.log_get("更新完成！统计信息：")
+            self.log_get(f"  成功更新: {len(updates)} 行")
+            self.log_get(f"  已跳过(已有tag1): {already_tagged} 行")
+            self.log_get("=" * 50)
+        except Exception as e:
+            self.log_get(f"更新YP链接时发生错误: {str(e)}")
+            import traceback
+            self.log_get(traceback.format_exc())
+        finally:
+            self.root.after(0, self._restore_get_ui)
+
     def copy_offers(self):
         """复制offer功能：识别只有国家代码和ASIN的行，复制完整信息并生成新投放链接"""
         if not self.feishu_app_id_var.get().strip() or not self.feishu_app_secret_var.get().strip():
@@ -789,6 +1786,7 @@ class OfferToolApp:
             return
         
         self.extract_btn.config(state='disabled')
+        self.update_yp_links_btn.config(state='disabled')
         self.copy_offer_btn.config(state='disabled')
         self.progress_get.start()
         self.log_text_get.delete(1.0, tk.END)
@@ -961,19 +1959,32 @@ class OfferToolApp:
                 # 生成新的投放链接
                 self.log_get(f"    获取新投放链接...")
                 uid = self.generate_random_uid()  # 为复制的offer生成随机uid
-                new_link = self.get_partnerboost_link(asin, country, uid)
-                
+
+                source_tracking_link = ''
+                if tracking_link_col is not None and tracking_link_col < len(source_row) and source_row[tracking_link_col]:
+                    source_tracking_link = source_row[tracking_link_col]
+                    if isinstance(source_tracking_link, list) and len(source_tracking_link) > 0 and isinstance(source_tracking_link[0], dict):
+                        source_tracking_link = source_tracking_link[0].get('link', '') or source_tracking_link[0].get('text', '')
+                    source_tracking_link = str(source_tracking_link).strip()
+
+                new_link = ''
+                if self._is_yp_tracking_link(source_tracking_link):
+                    new_link = self._append_yp_tag1_to_link(source_tracking_link, uid)
+                    self.log_get(f"    识别为YP链接，已生成新链接 (uid={uid})")
+                else:
+                    new_link = self.get_partnerboost_link(asin, country, uid)
+
                 if new_link and tracking_link_col is not None:
                     updates.append((row_idx, tracking_link_col, new_link))
-                    self.log_get(f"    新投放链接: {new_link[-20:]}... (uid={uid})")
-                    
-                    # 解析投放链接重定向，更新产品链接
-                    if product_link_col is not None:
+                    self.log_get(f"    新投放链接: {new_link[-40:]} (uid={uid})")
+
+                    # 仅PB链接需要解析重定向并更新产品链接；YP链接保留复制来的产品链接
+                    if product_link_col is not None and not self._is_yp_tracking_link(new_link):
                         redirect_url = self.resolve_redirect_url(new_link)
                         if redirect_url:
                             updates.append((row_idx, product_link_col, redirect_url))
                             self.log_get(f"    产品链接已更新: {redirect_url[:50]}...")
-                    
+
                     success_count += 1
                 else:
                     self.log_get(f"    [警告] 获取投放链接失败")
@@ -1003,36 +2014,7 @@ class OfferToolApp:
     
     def _apply_copy_updates(self, token, spreadsheet_token, sheet_id, updates, style_updates, headers_row):
         """应用复制offer的更新到飞书表格"""
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
-        
-        # 构建批量更新请求
-        value_ranges = []
-        for row_idx, col_idx, value in updates:
-            col_letter = self.index_to_column_letter(col_idx)
-            value_ranges.append({
-                'range': f"{sheet_id}!{col_letter}{row_idx}:{col_letter}{row_idx}",
-                'values': [[value]]
-            })
-        
-        # 分批处理，每批最多100个range
-        batch_size = 100
-        for i in range(0, len(value_ranges), batch_size):
-            batch = value_ranges[i:i+batch_size]
-            url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_batch_update"
-            body = {"valueRanges": batch}
-            
-            try:
-                response = requests.post(url, headers=headers, json=body, timeout=30)
-                data = response.json()
-                if data.get('code') == 0:
-                    self.log_get(f"  批次 {i//batch_size + 1}: 更新成功 {len(batch)} 个单元格")
-                else:
-                    self.log_get(f"  批次 {i//batch_size + 1}: 更新失败 - {data.get('msg', 'Unknown error')}")
-            except Exception as e:
-                self.log_get(f"  批次 {i//batch_size + 1}: 更新异常 - {str(e)}")
+        self._batch_update_sheet_cells(token, spreadsheet_token, updates)
         
         # 应用样式更新（蓝色加粗）
         if style_updates:
@@ -1080,20 +2062,15 @@ class OfferToolApp:
             except Exception as e:
                 self.log_get(f"  样式更新异常: {str(e)}")
     
-    def generate_random_uid(self):
-        """生成随机7位UID"""
-        import random
-        import string
-        return ''.join(random.choices(string.ascii_lowercase + string.digits, k=7))
-    
     # ==================== 品牌搜索量报告 ====================
     def get_brand_search_volume(self):
         """获取品牌搜索量报告"""
         if not self.pb_token_var.get().strip():
             messagebox.showerror("错误", "请在API配置中输入PartnerBoost Offer Token!")
             return
-        
+
         self.extract_btn.config(state='disabled')
+        self.update_yp_links_btn.config(state='disabled')
         self.copy_offer_btn.config(state='disabled')
         self.brand_search_btn.config(state='disabled')
         self.progress_get.start()
@@ -1791,6 +2768,43 @@ class OfferToolApp:
                 self.log_manage(f"  ✗ PartnerBoost连接失败: {e}")
                 self.log_config(f"  ✗ PartnerBoost连接失败: {e}")
                 results.append("PartnerBoost: 失败")
+
+            # 测试YeahPromos
+            self.log_manage("\n[YeahPromos API]")
+            self.log_config("\n[YeahPromos API]")
+            try:
+                yp_token = self.yp_token_var.get().strip()
+                yp_site_id = self.yp_site_id_var.get().strip()
+                if yp_token and yp_site_id:
+                    url = f"{YP_API_BASE_URL}/index/Getorder/getorder"
+                    headers = {"token": yp_token}
+                    params = {
+                        "site_id": yp_site_id,
+                        "startDate": (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d'),
+                        "endDate": datetime.now().strftime('%Y-%m-%d'),
+                        "is_amazon": 1,
+                        "limit": 1,
+                        "page": 1,
+                    }
+                    response = requests.get(url, headers=headers, params=params, timeout=30)
+                    data = response.json()
+                    if str(data.get("code", "")) == "100000":
+                        self.log_manage("  ✓ YeahPromos连接成功")
+                        self.log_config("  ✓ YeahPromos连接成功")
+                        results.append("YeahPromos: 成功")
+                    else:
+                        msg = data.get("msg") or data.get("message") or data.get("status") or "Unknown error"
+                        self.log_manage(f"  ✗ YeahPromos返回错误: {msg}")
+                        self.log_config(f"  ✗ YeahPromos返回错误: {msg}")
+                        results.append("YeahPromos: 失败")
+                else:
+                    self.log_manage("  - 未配置YP Token或Site ID，跳过测试")
+                    self.log_config("  - 未配置YP Token或Site ID，跳过测试")
+                    results.append("YeahPromos: 跳过")
+            except Exception as e:
+                self.log_manage(f"  ✗ YeahPromos连接失败: {e}")
+                self.log_config(f"  ✗ YeahPromos连接失败: {e}")
+                results.append("YeahPromos: 失败")
             
             self.log_manage("\n测试完成！")
             self.log_config("\n测试完成！")
@@ -2020,7 +3034,7 @@ class OfferToolApp:
             # 找到关键列的索引
             col_indices = {}
             target_cols = ['ASIN', '国家代码', '品牌名称', '品牌ID', '佣金', '库存状态', '更新时间', 
-                          '投放链接', '折扣价', '产品名称', '产品链接', '原价', '货币']
+                          '投放链接', '折扣价', '产品名称', '产品链接', '原价', '货币', '评论数', 'Reviews']
             for i, h in enumerate(headers_row):
                 h_str = str(h).strip() if h else ''
                 if h_str in target_cols:
@@ -2195,6 +3209,18 @@ class OfferToolApp:
                             changes.append(f"佣金: {old_commission} → {new_commission}")
                             if new_val < old_val:
                                 style_updates.append((row_idx, commission_col, 'red_bold'))
+
+                    # 评论数对比
+                    reviews_col = col_indices.get('评论数')
+                    if reviews_col is None:
+                        reviews_col = col_indices.get('Reviews')
+                    if reviews_col is not None:
+                        old_reviews = str(row[reviews_col]).strip() if reviews_col < len(row) and row[reviews_col] is not None else ''
+                        new_reviews = str(pb_offer.get('reviews', '')).strip()
+
+                        if old_reviews != new_reviews and new_reviews:
+                            updates.append((row_idx, reviews_col, new_reviews))
+                            changes.append(f"评论数: {old_reviews} → {new_reviews}")
                     
                     # 库存状态对比
                     stock_col = col_indices.get('库存状态')
@@ -2479,6 +3505,8 @@ class OfferToolApp:
             '品牌名称': 'brand_name',
             '折扣价': 'discount_price',  # PB返回的是discount_price
             '佣金': 'commission',
+            '评论数': 'reviews',
+            'Reviews': 'reviews',
             '产品名称': 'product_name',
             'ASIN': 'asin',
             '库存状态': 'availability',
@@ -2884,6 +3912,66 @@ class OfferToolApp:
                     asin, country, uid = uid_key
                     self.log_manage(f"    • UID={uid}, ASIN={asin}, 国家={country}, 佣金=${comm_value:.2f}")
             
+            # 步骤3.5：获取YeahPromos佣金数据
+            self.log_manage("\n【步骤3.5】获取YeahPromos佣金数据")
+            yp_commission_data = self.get_all_yp_commissions(start_date_str, end_date_str)
+            if self.stop_flag:
+                return
+
+            yp_asin_brand_commission = {}
+            yp_rejected_commission_total = 0.0
+            yp_non_rejected_commission_total = 0.0
+            yp_gross_commission_total = 0.0
+            yp_missing_asin_brand = 0
+
+            offer_groups = self.build_offer_row_groups(feishu_data)
+            yp_pid_brand_to_asin_brand = {}
+            for row in feishu_data:
+                if str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT:
+                    continue
+                link = str(self.normalize_sheet_cell_value(row.get('投放链接', '')) or '').strip()
+                if not self._is_yp_tracking_link(link):
+                    continue
+                asin = str(row.get('ASIN', '') or '').strip()
+                brand_id = str(row.get('品牌ID', '') or '').strip()
+                if not asin or not brand_id:
+                    continue
+                pid_match = re.search(r'[?&]pid=([^&]+)', link, re.IGNORECASE)
+                if pid_match:
+                    yp_pid_brand_to_asin_brand[(pid_match.group(1), brand_id)] = (asin, brand_id)
+
+            for trans in yp_commission_data:
+                comm = float(trans.get('sale_comm', 0) or 0)
+                yp_gross_commission_total += comm
+                status = str(trans.get('status', '') or '').strip().lower()
+                advert_id = str(trans.get('advert_id', '') or '').strip()
+                asin = str(trans.get('asin', '') or trans.get('prod_id', '') or '').strip().upper()
+                if not asin:
+                    asin = self.extract_asin_from_yp_order_id(trans.get('id', ''))
+                brand_id = str(trans.get('brand_id', '') or trans.get('bid', '') or advert_id).strip()
+
+                if not asin or not brand_id:
+                    yp_missing_asin_brand += 1
+                    continue
+
+                key = (asin, brand_id)
+                if key not in yp_asin_brand_commission:
+                    yp_asin_brand_commission[key] = {'non_rejected': 0.0, 'gross': 0.0, 'rejected': 0.0}
+                yp_asin_brand_commission[key]['gross'] += comm
+
+                if status == 'rejected':
+                    yp_asin_brand_commission[key]['rejected'] += comm
+                    yp_rejected_commission_total += comm
+                else:
+                    yp_asin_brand_commission[key]['non_rejected'] += comm
+                    yp_non_rejected_commission_total += comm
+
+            self.log_manage(
+                f"  YP佣金汇总: 非Rejected=${yp_non_rejected_commission_total:.2f}, "
+                f"总佣金=${yp_gross_commission_total:.2f}, Rejected=${yp_rejected_commission_total:.2f}, "
+                f"匹配组数={len(yp_asin_brand_commission)}, 缺少ASIN/品牌ID={yp_missing_asin_brand}"
+            )
+
             # 步骤4：更新飞书表格
             self.log_manage("\n【步骤4】更新飞书表格")
             self.update_progress_manage("更新飞书...")
@@ -2907,8 +3995,13 @@ class OfferToolApp:
                 asin_only_commission,
                 asin_country_uid_commission,
                 asin_country_no_uid_commission,
-                row_campaigns
+                row_campaigns,
+                yp_asin_brand_commission
             )
+            offer_commission_context['yp_matched_duplicate_keys'] = {
+                key for key, value in yp_asin_brand_commission.items()
+                if value.get('non_rejected', 0) > 0
+            }
             
             self.log_manage(f"  计算得到 {len(updates)} 个需要更新的offer")
             
@@ -2917,6 +4010,10 @@ class OfferToolApp:
                 for i, u in enumerate(updates[:5]):
                     self.log_manage(f"    [{i+1}] ASIN={u.get('asin')}, 国家={u.get('country')}, 状态={u.get('status')}")
                 self.apply_feishu_updates(feishu_token, updates)
+                self.consolidate_yp_duplicate_offer_rows(
+                    feishu_token,
+                    matched_keys=offer_commission_context.get('yp_matched_duplicate_keys')
+                )
             else:
                 self.log_manage("  没有需要更新的内容")
                 self.log_manage("  可能原因：")
@@ -2994,6 +4091,7 @@ class OfferToolApp:
             self.log_manage(f"  • Google Ads 广告系列总数: {len(campaign_data)}")
             self.log_manage(f"  • 飞书表格 Offer 总数: {len(feishu_data)}")
             self.log_manage(f"  • PartnerBoost 交易总数: {len(commission_data)}")
+            self.log_manage(f"  • YeahPromos 交易总数: {len(yp_commission_data)}")
             self.log_manage(f"  • 本次更新的 Offer 数: {len(updates)}")
             
             self.log_manage("\n⚠️ 未匹配数据:")
@@ -3038,7 +4136,7 @@ class OfferToolApp:
             )
             total_unmatched_commission = total_pb_non_rejected_for_unmatched - total_matched_commission
             self.log_manage(f"  • 未匹配佣金合计: ${total_unmatched_commission:.2f}（= PB总额${total_pb_non_rejected_for_unmatched:.2f} - 已匹配${total_matched_commission:.2f}）")
-            self.log_manage(f"  • Rejected佣金合计: ${rejected_commission_total:.2f}")
+            self.log_manage(f"  • Rejected佣金合计: ${rejected_commission_total + yp_rejected_commission_total:.2f}")
             
             self.log_manage("\n📈 更新统计:")
             if status_counts:
@@ -3059,6 +4157,7 @@ class OfferToolApp:
             self.log_manage(f"  • 无法提取ASIN的广告系列: {campaigns_without_asin} 个")
             self.log_manage(f"  • 无法提取国家的广告系列: {campaigns_without_country} 个")
             self.log_manage(f"  • PB交易中Rejected状态: {skipped_rejected} 条")
+            self.log_manage(f"  • YP交易中缺少ASIN/品牌ID: {yp_missing_asin_brand} 条")
             self.log_manage(f"  • PB交易中无ASIN: {skipped_no_asin} 条")
             self.log_manage(f"  • PB佣金国家来源: customer_country={country_from_customer}, merchant_name={country_from_merchant}, mcid={country_from_mcid}, 默认US={country_default_us}")
             
@@ -3089,18 +4188,22 @@ class OfferToolApp:
                     self.log_manage(f"  ⚠ 无法获取MCC全部花费，使用当前广告系列花费")
                 
                 self.log_manage(f"  飞书表格所有Offer汇总:")
-                self.log_manage(f"    • 非Rejected佣金: ${non_rejected_commission_total:.2f}")
-                self.log_manage(f"    • 总佣金: ${gross_commission_total:.2f}")
-                self.log_manage(f"    • Rejected佣金: ${rejected_commission_total:.2f}")
+                combined_non_rejected_commission_total = non_rejected_commission_total + yp_non_rejected_commission_total
+                combined_gross_commission_total = gross_commission_total + yp_gross_commission_total
+                combined_rejected_commission_total = rejected_commission_total + yp_rejected_commission_total
+
+                self.log_manage(f"    • 非Rejected佣金: ${combined_non_rejected_commission_total:.2f}")
+                self.log_manage(f"    • 总佣金: ${combined_gross_commission_total:.2f}")
+                self.log_manage(f"    • Rejected佣金: ${combined_rejected_commission_total:.2f}")
                 self.log_manage(f"    • MCC总花费(USD): ${total_cost_sum:.2f}")
                 
                 # 更新第二行（总计行），传入未匹配佣金和Rejected佣金
                 self.update_feishu_summary_row(
                     feishu_token,
-                    non_rejected_commission_total,
+                    combined_non_rejected_commission_total,
                     total_cost_sum,
-                    gross_commission_total,
-                    rejected_commission_total
+                    combined_gross_commission_total,
+                    combined_rejected_commission_total
                 )
                 
             except Exception as e:
@@ -3154,9 +4257,12 @@ class OfferToolApp:
                     feishu_token=feishu_token,
                     campaign_data=campaign_data,
                     commission_data=commission_data,
+                    yp_commission_data=yp_commission_data,
                     feishu_data=feishu_data,
                     campaign_id_to_tracking_link=campaign_id_to_tracking_link,
-                    offer_commission_context=offer_commission_context
+                    offer_commission_context=offer_commission_context,
+                    start_date_str=start_date_str,
+                    end_date_str=end_date_str
                 )
             except Exception as e:
                 self.log_manage(f"  更新广告系列表格时出错: {str(e)}")
@@ -3213,15 +4319,18 @@ class OfferToolApp:
         finally:
             self.root.after(0, self._restore_manage_ui)
     
-    def update_campaigns_sheet(self, feishu_token, campaign_data, commission_data, feishu_data, campaign_id_to_tracking_link=None, offer_commission_context=None):
+    def update_campaigns_sheet(self, feishu_token, campaign_data, commission_data, yp_commission_data, feishu_data, campaign_id_to_tracking_link=None, offer_commission_context=None, start_date_str=None, end_date_str=None):
         """更新'广告系列'表格
         
         Args:
             feishu_token: 飞书访问令牌
             campaign_data: Google Ads广告系列数据列表
             commission_data: PB佣金数据列表
+            yp_commission_data: YP佣金数据列表
             feishu_data: offer表格数据（用于获取广告系列名称-投放链接映射）
             offer_commission_context: offer行级佣金归因结果，确保广告系列与offer使用同口径
+            start_date_str: 本次统计开始日期（用于汇总已移除广告系列历史指标）
+            end_date_str: 本次统计结束日期（用于汇总已移除广告系列历史指标）
         """
         # 新表格的配置
         campaigns_spreadsheet_token = "KnJ1wphpBiVMrGkWl5ncUkMGnfe"
@@ -3235,12 +4344,21 @@ class OfferToolApp:
         self.log_manage("  构建(ASIN+国家)到投放链接和每单佣金的映射...")
         if campaign_id_to_tracking_link is None:
             campaign_id_to_tracking_link = {}
+
+        try:
+            latest_feishu_data = self.get_feishu_sheet_data(feishu_token)
+            if latest_feishu_data:
+                feishu_data = latest_feishu_data
+        except Exception as e:
+            self.log_manage(f"  读取最新Offer表失败，继续使用内存快照: {str(e)}")
         
         asin_country_to_tracking_links = {}  # {(asin, country): [tracking_link, ...]} 改为列表，支持多个链接
         asin_country_to_commission_per_order = {}  # {(asin, country): commission_per_order}
         
         rows_with_tracking_link = 0
         for row in feishu_data:
+            if str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT:
+                continue
             asin = row.get('ASIN', '')
             country = row.get('国家代码', '')
             tracking_link = row.get('投放链接', '')
@@ -3290,6 +4408,13 @@ class OfferToolApp:
         if offer_commission_context is None:
             offer_commission_context = {}
 
+        offer_row_commissions = offer_commission_context.get('row_commissions', {}) or {}
+        yp_offer_context = self.build_yp_offer_group_context(
+            feishu_data,
+            offer_row_commissions=offer_row_commissions
+        )
+        offer_group_summary_by_key = yp_offer_context.get('offer_group_summary_by_key', {})
+
         def normalize_link_value(value):
             if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
                 return value[0].get('link', '') or value[0].get('text', '')
@@ -3316,11 +4441,35 @@ class OfferToolApp:
                     'asin': campaign.get('asin', ''),
                     'country': campaign.get('country', ''),
                     'final_urls': campaign.get('final_urls', []),
-                    'final_url_suffix': campaign.get('final_url_suffix', '')
+                    'final_url_suffix': campaign.get('final_url_suffix', ''),
+                    'clicks': 0,
+                    'avg_cpc_usd': 0.0,
+                    '_cpc_weighted_cost': 0.0,
+                    '_cpc_weighted_clicks': 0,
+                    '_traffic_source': 'pb',
+                    'enabled_keyword_ctr_weighted_numerator': 0.0,
+                    'enabled_keyword_ctr_impressions': 0
                 }
             
             # 累加花费
             mcc_campaigns[campaign_name]['cost_usd'] += campaign.get('cost_usd', 0)
+            mcc_campaigns[campaign_name]['enabled_keyword_ctr_weighted_numerator'] += campaign.get(
+                'enabled_keyword_ctr_weighted_numerator', 0.0
+            )
+            mcc_campaigns[campaign_name]['enabled_keyword_ctr_impressions'] += campaign.get(
+                'enabled_keyword_ctr_impressions', 0
+            )
+            campaign_clicks = int(campaign.get('clicks', 0) or 0)
+            campaign_avg_cpc = float(campaign.get('avg_cpc_usd', 0.0) or 0.0)
+            mcc_campaigns[campaign_name]['clicks'] += campaign_clicks
+            if campaign_clicks > 0:
+                mcc_campaigns[campaign_name]['_cpc_weighted_cost'] += campaign_avg_cpc * campaign_clicks
+                mcc_campaigns[campaign_name]['_cpc_weighted_clicks'] += campaign_clicks
+                total_clicks_for_cpc = mcc_campaigns[campaign_name]['_cpc_weighted_clicks']
+                if total_clicks_for_cpc > 0:
+                    mcc_campaigns[campaign_name]['avg_cpc_usd'] = (
+                        mcc_campaigns[campaign_name]['_cpc_weighted_cost'] / total_clicks_for_cpc
+                    )
             
             # 如果之前没有ASIN/国家，尝试从当前campaign获取
             if not mcc_campaigns[campaign_name]['asin'] and campaign.get('asin'):
@@ -3347,9 +4496,14 @@ class OfferToolApp:
         existing_campaign_cost = {}   # {campaign_name: float} 上次运行时的花费
         existing_campaign_commission = {}  # {campaign_name: float} 上次运行时的佣金
         existing_campaign_status = {}  # {campaign_name: str} 上次运行时的状态
+        existing_campaign_clicks = {}  # {campaign_name: str}
+        existing_campaign_cpc = {}  # {campaign_name: str}
         for row_data in existing_rows:
             name = row_data.get('广告系列名称', '')
             row_idx = row_data.get('row_index')
+            status = str(row_data.get('状态', '') or '').strip()
+            if status == SUMMARY_STATUS_TEXT:
+                continue
             if name and row_idx:
                 existing_campaign_names[name] = row_idx
                 existing_link = row_data.get('投放链接', '')
@@ -3362,25 +4516,30 @@ class OfferToolApp:
                 existing_campaign_commission[name] = self.parse_commission_value(row_data.get('总佣金', ''))
                 # 记录上次的状态（用于检测状态变更）
                 existing_campaign_status[name] = str(row_data.get('状态', '') or '').strip()
+                existing_campaign_clicks[name] = str(row_data.get('总点击数', '') or '').strip()
+                existing_campaign_cpc[name] = str(row_data.get('CPC', '') or '').strip()
 
         existing_campaign_row_info = {}
         for row_data in existing_rows:
             name = row_data.get('广告系列名称', '')
             row_idx = row_data.get('row_index')
+            status = str(row_data.get('状态', '') or '').strip()
+            if status == SUMMARY_STATUS_TEXT:
+                continue
             if name and row_idx:
                 existing_campaign_row_info[name] = {
                     'row_index': row_idx,
                     'campaign_name': name,
-                    'status': str(row_data.get('状态', '') or '').strip(),
+                    'status': status,
                 }
 
         def extract_tracking_uid(link):
             link = normalize_link_value(link)
             if not link:
                 return ''
-            uid_match = re.search(r'[?&]uid=([^&]+)', link)
-            if uid_match:
-                return uid_match.group(1)
+            uid = self.extract_tracking_uid_from_link(link)
+            if uid:
+                return uid
             return link[-7:] if len(link) >= 7 else link
 
         current_campaign_id_to_name = {}
@@ -3507,7 +4666,7 @@ class OfferToolApp:
         
         # 用于追踪每个(ASIN+国家)已分配的投放链接索引，确保不同campaign获得不同链接
         key_link_assigned_idx = {}  # {(asin, country): next_index}
-        
+
         # 处理MCC中的所有广告系列
         for campaign_name, campaign_info in mcc_campaigns.items():
             # 通过(ASIN+国家)获取投放链接和每单佣金
@@ -3597,6 +4756,14 @@ class OfferToolApp:
             commission_increment = total_commission - prev_commission
             roi_cost = prev_cost if preserve_existing_cost else cost
             roi = round(total_commission / roi_cost, 1) if roi_cost > 0 else 0
+            keyword_ctr_weighted_numerator = campaign_info.get('enabled_keyword_ctr_weighted_numerator', 0.0)
+            keyword_ctr_impressions = campaign_info.get('enabled_keyword_ctr_impressions', 0)
+            enabled_keyword_ctr = (
+                keyword_ctr_weighted_numerator / keyword_ctr_impressions * 100
+                if keyword_ctr_impressions > 0 else 0.0
+            )
+            total_clicks = int(campaign_info.get('clicks', 0) or 0)
+            avg_cpc_usd = float(campaign_info.get('avg_cpc_usd', 0.0) or 0.0)
             if preserve_existing_cost:
                 preserved_campaign_cost_rows.append({
                     'campaign_name': campaign_name,
@@ -3611,6 +4778,17 @@ class OfferToolApp:
                     f"  保留已有投放链接: {campaign_name} | campaign_id={campaign_id or 'None'}"
                 )
 
+            offer_group_key, offer_group_summary = self.resolve_yp_campaign_offer_group(
+                campaign_name,
+                campaign_info,
+                yp_offer_context,
+                tracking_link_to_write
+            )
+            if offer_group_key:
+                campaign_info['_offer_group_key'] = offer_group_key
+                campaign_info['_offer_group_summary'] = offer_group_summary
+                campaign_info['_traffic_source'] = 'yp' if offer_group_summary.get('is_yp') else 'pb'
+
             # 准备更新数据
             update_data = {
                 'campaign_name': campaign_name,
@@ -3624,9 +4802,14 @@ class OfferToolApp:
                 '佣金ASIN': asins_str,
                 '每单佣金': commission_per_order,
                 '产品链接': product_link_url,
+                '已启用关键字CTR': f"{enabled_keyword_ctr:.2f}%",
+                '总点击数': total_clicks,
+                'CPC': f"${avg_cpc_usd:.2f}" if total_clicks > 0 else "$0.00",
                 '新增广告系列花费': None if preserve_existing_cost else f"${cost_increment:.2f}",
                 '新增佣金': f"${commission_increment:.2f}",
-                'status_color': status_color
+                'status_color': status_color,
+                '_offer_group_key': offer_group_key,
+                '_offer_group_summary': offer_group_summary,
             }
             
             if campaign_name in existing_campaign_names:
@@ -3649,22 +4832,171 @@ class OfferToolApp:
             if len(preserved_campaign_cost_rows) > 3:
                 self.log_manage(f"      ... 还有 {len(preserved_campaign_cost_rows) - 3} 行未显示")
 
+        removed_campaign_metrics = {}
+        removed_campaign_sources = {}
+        if start_date_str and end_date_str:
+            removed_candidates = sorted(
+                name for name in existing_campaign_names.keys()
+                if name and name not in mcc_campaigns
+            )
+            if removed_candidates:
+                for campaign_name in removed_candidates:
+                    existing_tracking_link = existing_campaign_links.get(campaign_name, '')
+                    _, offer_summary = self.resolve_yp_campaign_offer_group(
+                        campaign_name,
+                        {
+                            'campaign_name': campaign_name,
+                            'asin': '',
+                            'country': '',
+                            'campaign_id': '',
+                            'tracking_link': existing_tracking_link,
+                        },
+                        yp_offer_context,
+                        existing_tracking_link
+                    )
+                    removed_campaign_sources[campaign_name] = 'yp' if offer_summary.get('is_yp') else 'pb'
+                removed_campaign_metrics = self.get_removed_campaign_metrics(
+                    start_date_str=start_date_str,
+                    end_date_str=end_date_str,
+                    campaign_names=removed_candidates
+                )
+
         # 处理已删除的广告系列（在表格中存在但MCC中不存在）
         for campaign_name, row_idx in existing_campaign_names.items():
             if campaign_name not in mcc_campaigns:
                 ended_commission = round(campaign_commission_totals.get(campaign_name, 0.0), 2)
                 ended_asins = ', '.join(sorted(campaign_commission_asins.get(campaign_name, set())))
                 prev_commission = existing_campaign_commission.get(campaign_name, 0.0)
-                updates.append({
+                existing_tracking_link = existing_campaign_links.get(campaign_name, '')
+                ended_offer_group_key, ended_offer_group_summary = self.resolve_yp_campaign_offer_group(
+                    campaign_name,
+                    {
+                        'campaign_name': campaign_name,
+                        'asin': '',
+                        'country': '',
+                        'campaign_id': '',
+                        'tracking_link': existing_tracking_link,
+                    },
+                    yp_offer_context,
+                    existing_tracking_link
+                )
+                ended_update = {
                     'campaign_name': campaign_name,
                     'row_index': row_idx,
                     '状态': '投放已结束',
                     '总佣金': f"${ended_commission:.2f}",
                     '佣金ASIN': ended_asins,
+                    '已启用关键字CTR': '0.00%',
                     '新增佣金': f"${ended_commission - prev_commission:.2f}",
-                    'status_color': 'black'
-                })
+                    'status_color': 'black',
+                    '_offer_group_key': ended_offer_group_key,
+                    '_offer_group_summary': ended_offer_group_summary,
+                }
+                removed_metrics = removed_campaign_metrics.get(campaign_name, {})
+                if not existing_campaign_clicks.get(campaign_name, '') and ('clicks' in removed_metrics):
+                    ended_update['总点击数'] = int(removed_metrics.get('clicks', 0) or 0)
+                if not existing_campaign_cpc.get(campaign_name, '') and ('avg_cpc_usd' in removed_metrics):
+                    clicks = int(removed_metrics.get('clicks', 0) or 0)
+                    ended_update['CPC'] = f"${float(removed_metrics.get('avg_cpc_usd', 0.0) or 0.0):.2f}" if clicks > 0 else "$0.00"
+                updates.append(ended_update)
         
+        final_campaign_rows = {}
+        for row_data in existing_rows:
+            status = str(row_data.get('状态', '') or '').strip()
+            campaign_name = str(row_data.get('广告系列名称', '') or '').strip()
+            row_idx = row_data.get('row_index')
+            if status == SUMMARY_STATUS_TEXT or not campaign_name or not row_idx:
+                continue
+            final_campaign_rows[campaign_name] = {
+                'campaign_name': campaign_name,
+                'row_index': row_idx,
+                'status': status,
+                'total_commission': self.parse_commission_value(row_data.get('总佣金', '')),
+                'total_clicks': int(self.parse_commission_value(row_data.get('总点击数', '')) or 0),
+            }
+
+        for update in updates:
+            campaign_name = str(update.get('campaign_name', '') or '').strip()
+            row_idx = update.get('row_index')
+            if not campaign_name or not row_idx:
+                continue
+            final_campaign_rows[campaign_name] = {
+                'campaign_name': campaign_name,
+                'row_index': row_idx,
+                'status': str(update.get('状态', '') or final_campaign_rows.get(campaign_name, {}).get('status', '')).strip(),
+                'total_commission': self.parse_commission_value(
+                    update.get('总佣金', final_campaign_rows.get(campaign_name, {}).get('total_commission', 0.0))
+                ),
+                'total_clicks': int(
+                    self.parse_commission_value(
+                        update.get('总点击数', final_campaign_rows.get(campaign_name, {}).get('total_clicks', 0))
+                    ) or 0
+                ),
+            }
+
+        for new_row in new_rows:
+            campaign_name = str(new_row.get('campaign_name', '') or '').strip()
+            if not campaign_name:
+                continue
+            synthetic_row_index = f"new:{campaign_name}"
+            final_campaign_rows[campaign_name] = {
+                'campaign_name': campaign_name,
+                'row_index': synthetic_row_index,
+                'status': str(new_row.get('状态', '') or '').strip(),
+                'total_commission': self.parse_commission_value(new_row.get('总佣金', '')),
+                'total_clicks': int(self.parse_commission_value(new_row.get('总点击数', '')) or 0),
+            }
+
+        yp_row_apply_result = self.apply_yp_group_commissions_to_campaign_rows(
+            updates=updates,
+            new_rows=new_rows,
+            offer_group_summary_by_key=offer_group_summary_by_key,
+            existing_campaign_commission=existing_campaign_commission,
+            existing_campaign_cost=existing_campaign_cost,
+        )
+        if yp_row_apply_result.get('applied_rows', 0) > 0 or yp_row_apply_result.get('skipped_groups', 0) > 0:
+            self.log_manage(
+                f"    YP佣金补写到广告系列行: 成功 {yp_row_apply_result.get('applied_rows', 0)} 组, "
+                f"多广告系列分组保留给统计行 {yp_row_apply_result.get('skipped_groups', 0)} 组"
+            )
+
+        brand_country_totals, brand_country_offer_index = self.calculate_break_even_brand_country_commissions(
+            feishu_data=feishu_data,
+            commission_data=commission_data,
+            yp_commission_data=yp_commission_data
+        )
+        brand_country_clicks = {}
+        if start_date_str and end_date_str:
+            brand_country_clicks = self.get_brand_country_clicks(
+                start_date_str=start_date_str,
+                end_date_str=end_date_str,
+                offer_index=brand_country_offer_index
+            )
+            for key, click_info in brand_country_clicks.items():
+                aggregate = brand_country_totals.setdefault(key, {
+                    'brand': click_info.get('brand', ''),
+                    'country': click_info.get('country', ''),
+                    'commission': 0.0,
+                    'clicks': 0,
+                })
+                aggregate['clicks'] = int(click_info.get('clicks', 0) or 0)
+        if start_date_str and end_date_str:
+            self.log_manage(
+                f"    品牌收支平衡CPC口径: 仅统计 {start_date_str} 至 {end_date_str} 的佣金与点击"
+            )
+
+        break_even_updates = self.apply_brand_break_even_cpc(
+            updates=updates,
+            new_rows=new_rows,
+            mcc_campaigns=mcc_campaigns,
+            brand_country_totals=brand_country_totals
+        )
+
+        if break_even_updates > 0:
+            self.log_manage(f"    品牌收支平衡CPC已更新: {break_even_updates} 行")
+        else:
+            self.log_manage("    品牌收支平衡CPC: 本次没有可更新的投放中/暂停中广告系列")
+
         self.log_manage(f"    需要更新 {len(updates)} 行，新增 {len(new_rows)} 行")
         
         # 步骤6：执行更新
@@ -3680,8 +5012,253 @@ class OfferToolApp:
             )
         else:
             self.log_manage("  没有需要更新的内容")
+
+        try:
+            self.consolidate_campaign_sheet_same_offer_rows(
+                feishu_token,
+                campaigns_spreadsheet_token,
+                campaigns_sheet_id,
+                mcc_campaigns,
+                yp_offer_context
+            )
+        except Exception as e:
+            self.log_manage(f"  整理广告系列相同offer统计行时出错: {str(e)}")
         
         return report
+
+    def backfill_ended_campaign_metrics_once(self, start_date_str, end_date_str):
+        """一次性回填广告系列表中“投放已结束”行的总点击数和CPC。"""
+        campaigns_spreadsheet_token = "KnJ1wphpBiVMrGkWl5ncUkMGnfe"
+        campaigns_sheet_id = "XrkOF7"
+
+        self.log_manage("=" * 50)
+        self.log_manage("开始一次性回填“投放已结束”广告系列点击数/CPC...")
+        self.log_manage(f"统计日期范围: {start_date_str} 至 {end_date_str}")
+        self.log_manage("=" * 50)
+
+        feishu_token = self.get_feishu_token()
+        if not feishu_token:
+            self.log_manage("  ✗ 获取飞书Token失败")
+            return {'updated_rows': 0, 'candidate_rows': 0, 'matched_metrics': 0}
+
+        self.log_manage("  读取现有广告系列表格...")
+        existing_campaigns_data = self.read_campaigns_sheet(feishu_token, campaigns_spreadsheet_token, campaigns_sheet_id)
+        if existing_campaigns_data is None:
+            self.log_manage("  ✗ 无法读取广告系列表格")
+            return {'updated_rows': 0, 'candidate_rows': 0, 'matched_metrics': 0}
+
+        existing_rows, column_map, first_empty_row = existing_campaigns_data
+
+        ended_candidates = []
+        ended_row_index_by_name = {}
+        existing_clicks = {}
+        existing_cpc = {}
+        for row_data in existing_rows:
+            status = str(row_data.get('状态', '') or '').strip()
+            if status != '投放已结束':
+                continue
+
+            campaign_name = str(row_data.get('广告系列名称', '') or '').strip()
+            row_idx = row_data.get('row_index')
+            if not campaign_name or not row_idx:
+                continue
+
+            clicks_value = str(row_data.get('总点击数', '') or '').strip()
+            cpc_value = str(row_data.get('CPC', '') or '').strip()
+            needs_clicks_backfill = not clicks_value
+            needs_cpc_backfill = not cpc_value
+            if not (needs_clicks_backfill or needs_cpc_backfill):
+                continue
+
+            ended_candidates.append(campaign_name)
+            ended_row_index_by_name[campaign_name] = row_idx
+            existing_clicks[campaign_name] = clicks_value
+            existing_cpc[campaign_name] = cpc_value
+
+        if not ended_candidates:
+            self.log_manage("  没有需要补录点击数/CPC的“投放已结束”广告系列")
+            return {'updated_rows': 0, 'candidate_rows': 0, 'matched_metrics': 0}
+
+        self.log_manage(f"  待补录候选: {len(ended_candidates)} 个广告系列")
+        removed_campaign_metrics = self.get_removed_campaign_metrics(
+            start_date_str,
+            end_date_str,
+            ended_candidates
+        )
+
+        updates = []
+        matched_metrics = 0
+        for campaign_name in ended_candidates:
+            removed_metrics = removed_campaign_metrics.get(campaign_name)
+            if not removed_metrics:
+                continue
+
+            update = {
+                'campaign_name': campaign_name,
+                'row_index': ended_row_index_by_name[campaign_name],
+            }
+            wrote_any = False
+
+            if not existing_clicks.get(campaign_name, '') and ('clicks' in removed_metrics):
+                update['总点击数'] = int(removed_metrics.get('clicks', 0) or 0)
+                wrote_any = True
+
+            if not existing_cpc.get(campaign_name, '') and ('avg_cpc_usd' in removed_metrics):
+                clicks = int(removed_metrics.get('clicks', 0) or 0)
+                update['CPC'] = f"${float(removed_metrics.get('avg_cpc_usd', 0.0) or 0.0):.2f}" if clicks > 0 else "$0.00"
+                wrote_any = True
+
+            if wrote_any:
+                updates.append(update)
+                matched_metrics += 1
+
+        if not updates:
+            self.log_manage("  Google Ads中未命中需要补录的已移除广告系列")
+            return {'updated_rows': 0, 'candidate_rows': len(ended_candidates), 'matched_metrics': 0}
+
+        self.log_manage(f"  准备写回 {len(updates)} 行“投放已结束”广告系列")
+        self.apply_campaigns_sheet_updates(
+            feishu_token,
+            campaigns_spreadsheet_token,
+            campaigns_sheet_id,
+            updates,
+            [],
+            column_map,
+            first_empty_row
+        )
+        self.log_manage("  ✅ 一次性回填完成")
+        return {
+            'updated_rows': len(updates),
+            'candidate_rows': len(ended_candidates),
+            'matched_metrics': matched_metrics
+        }
+
+    def backfill_ended_campaign_break_even_cpc_once(self, start_date_str, end_date_str):
+        """一次性回填广告系列表中“投放已结束”且Google Ads中能命中的广告系列的品牌收支平衡CPC。"""
+        campaigns_spreadsheet_token = "KnJ1wphpBiVMrGkWl5ncUkMGnfe"
+        campaigns_sheet_id = "XrkOF7"
+
+        self.log_manage("=" * 50)
+        self.log_manage("开始一次性回填“投放已结束”广告系列品牌收支平衡CPC...")
+        self.log_manage(f"统计日期范围: {start_date_str} 至 {end_date_str}")
+        self.log_manage("=" * 50)
+
+        feishu_token = self.get_feishu_token()
+        if not feishu_token:
+            self.log_manage("  ✗ 获取飞书Token失败")
+            return {'updated_rows': 0, 'candidate_rows': 0, 'matched_metrics': 0, 'break_even_updates': 0}
+
+        self.log_manage("  读取Offer表格...")
+        offer_rows = self.get_feishu_sheet_data(feishu_token)
+        if not offer_rows:
+            self.log_manage("  ✗ 无法读取Offer表格")
+            return {'updated_rows': 0, 'candidate_rows': 0, 'matched_metrics': 0, 'break_even_updates': 0}
+
+        self.log_manage("  读取广告系列表格...")
+        existing_campaigns_data = self.read_campaigns_sheet(feishu_token, campaigns_spreadsheet_token, campaigns_sheet_id)
+        if existing_campaigns_data is None:
+            self.log_manage("  ✗ 无法读取广告系列表格")
+            return {'updated_rows': 0, 'candidate_rows': 0, 'matched_metrics': 0, 'break_even_updates': 0}
+
+        existing_rows, column_map, first_empty_row = existing_campaigns_data
+
+        ended_candidates = []
+        updates = []
+        for row_data in existing_rows:
+            status = str(row_data.get('状态', '') or '').strip()
+            if status != '投放已结束':
+                continue
+
+            campaign_name = str(row_data.get('广告系列名称', '') or '').strip()
+            row_idx = row_data.get('row_index')
+            if not campaign_name or not row_idx:
+                continue
+
+            ended_candidates.append(campaign_name)
+            updates.append({
+                'campaign_name': campaign_name,
+                'row_index': row_idx,
+                '状态': status,
+            })
+
+        if not ended_candidates:
+            self.log_manage("  没有“投放已结束”广告系列需要回填品牌收支平衡CPC")
+            return {'updated_rows': 0, 'candidate_rows': 0, 'matched_metrics': 0, 'break_even_updates': 0}
+
+        self.log_manage(f"  待处理候选: {len(ended_candidates)} 个广告系列")
+
+        removed_campaign_metrics = self.get_removed_campaign_metrics(
+            start_date_str=start_date_str,
+            end_date_str=end_date_str,
+            campaign_names=ended_candidates
+        )
+        matched_campaign_names = {
+            str(name).strip()
+            for name, metrics in (removed_campaign_metrics or {}).items()
+            if metrics is not None
+        }
+
+        applicable_updates = [item for item in updates if str(item.get('campaign_name', '') or '').strip() in matched_campaign_names]
+        if not applicable_updates:
+            self.log_manage("  Google Ads中未命中任何“投放已结束”广告系列，无法回填品牌收支平衡CPC")
+            return {
+                'updated_rows': 0,
+                'candidate_rows': len(ended_candidates),
+                'matched_metrics': len(matched_campaign_names),
+                'break_even_updates': 0
+            }
+
+        commission_data = self.get_all_commissions(start_date_str, end_date_str)
+        yp_commission_data = self.get_all_yp_commissions(start_date_str, end_date_str)
+        brand_country_totals, brand_country_offer_index = self.calculate_break_even_brand_country_commissions(
+            feishu_data=offer_rows,
+            commission_data=commission_data,
+            yp_commission_data=yp_commission_data
+        )
+        brand_country_clicks = self.get_brand_country_clicks(
+            start_date_str=start_date_str,
+            end_date_str=end_date_str,
+            offer_index=brand_country_offer_index
+        )
+        for key, click_info in brand_country_clicks.items():
+            aggregate = brand_country_totals.setdefault(key, {
+                'brand': click_info.get('brand', ''),
+                'country': click_info.get('country', ''),
+                'commission': 0.0,
+                'clicks': 0,
+            })
+            aggregate['clicks'] = int(click_info.get('clicks', 0) or 0)
+
+        break_even_updates = self.apply_brand_break_even_cpc_to_ended_rows(
+            updates=applicable_updates,
+            brand_country_totals=brand_country_totals
+        )
+        if break_even_updates <= 0:
+            self.log_manage("  本次没有可回填品牌收支平衡CPC的已结束广告系列")
+            return {
+                'updated_rows': 0,
+                'candidate_rows': len(ended_candidates),
+                'matched_metrics': len(matched_campaign_names),
+                'break_even_updates': 0
+            }
+
+        self.log_manage(f"  准备写回 {break_even_updates} 行“投放已结束”广告系列的品牌收支平衡CPC")
+        self.apply_campaigns_sheet_updates(
+            feishu_token,
+            campaigns_spreadsheet_token,
+            campaigns_sheet_id,
+            applicable_updates,
+            [],
+            column_map,
+            first_empty_row
+        )
+        self.log_manage("  ✅ 已结束广告系列品牌收支平衡CPC回填完成")
+        return {
+            'updated_rows': break_even_updates,
+            'candidate_rows': len(ended_candidates),
+            'matched_metrics': len(matched_campaign_names),
+            'break_even_updates': break_even_updates
+        }
     
     def read_campaigns_sheet(self, token, spreadsheet_token, sheet_id):
         """读取广告系列表格数据
@@ -3765,7 +5342,8 @@ class OfferToolApp:
         
         # 定义字段到列的映射（完全基于表头文字匹配，不使用硬编码列位置）
         all_fields = ['状态', '广告系列名称', '投放中的ads', '投放链接', '广告系列总花费', 
-                      '总佣金', 'ROI', '佣金ASIN', '每单佣金', '产品链接',
+                      '总佣金', 'ROI', '佣金ASIN', '每单佣金', '产品链接', '已启用关键字CTR',
+                      '总点击数', 'CPC', '品牌收支平衡CPC',
                       '新增广告系列花费', '新增佣金']
         field_to_column = {}
         missing_fields = []
@@ -3863,7 +5441,8 @@ class OfferToolApp:
             'green': {'red': 0, 'green': 128, 'blue': 0},
             'orange': {'red': 255, 'green': 165, 'blue': 0},
             'black': {'red': 0, 'green': 0, 'blue': 0},
-            'red': {'red': 255, 'green': 0, 'blue': 0}
+            'red': {'red': 255, 'green': 0, 'blue': 0},
+            'deep_pink': {'red': 199, 'green': 21, 'blue': 133}
         }
         
         # 准备样式更新请求
@@ -3898,6 +5477,180 @@ class OfferToolApp:
                     self.log_manage(f"    样式更新失败: {data.get('msg', 'Unknown error')}")
             except Exception as e:
                 self.log_manage(f"    样式更新异常: {str(e)}")
+
+    def consolidate_campaign_sheet_same_offer_rows(self, token, spreadsheet_token, sheet_id, mcc_campaigns, yp_offer_context=None):
+        """在广告系列表中为同一个offer的多个广告系列插入统计行。"""
+        result = self.read_campaigns_sheet(token, spreadsheet_token, sheet_id)
+        if result is None:
+            self.log_manage("  无法读取广告系列表，跳过相同offer统计行整理")
+            return
+
+        existing_rows, column_map, _ = result
+        campaign_name_col = column_map.get('广告系列名称')
+        if not campaign_name_col:
+            self.log_manage("  广告系列表缺少“广告系列名称”列，跳过相同offer统计行整理")
+            return
+
+        yp_offer_context = yp_offer_context or {}
+
+        def build_campaign_offer_group_map():
+            rows_now, _, _ = self.read_campaigns_sheet(token, spreadsheet_token, sheet_id)
+            group_to_rows = {}
+            summary_rows = {}
+            row_by_index = {}
+            ordered_rows = []
+
+            for row in rows_now:
+                row_index = row.get('row_index')
+                if not row_index or row_index < 2:
+                    continue
+                row_by_index[row_index] = row
+                ordered_rows.append(row_index)
+
+                status = str(row.get('状态', '') or '').strip()
+                campaign_name = str(row.get('广告系列名称', '') or '').strip()
+                if not campaign_name:
+                    continue
+
+                if status == SUMMARY_STATUS_TEXT:
+                    parts = [part.strip() for part in campaign_name.split('|')]
+                    if len(parts) >= 3:
+                        asin = parts[0]
+                        brand_id = parts[1]
+                        country = self.normalize_country_code(parts[2])
+                        if asin and country:
+                            summary_rows[(asin, brand_id, country)] = row_index
+                    continue
+
+                campaign_info = mcc_campaigns.get(campaign_name)
+                offer_key = None
+                if campaign_info:
+                    offer_key = row.get('_offer_group_key')
+                    if not offer_key:
+                        offer_key = campaign_info.get('_offer_group_key')
+                if not offer_key:
+                    tracking_link = row.get('投放链接', '')
+                    offer_key, _ = self.resolve_yp_campaign_offer_group(
+                        campaign_name,
+                        {
+                            'campaign_name': campaign_name,
+                            'asin': '',
+                            'country': '',
+                            'campaign_id': '',
+                            'tracking_link': tracking_link,
+                        },
+                        yp_offer_context,
+                        tracking_link
+                    )
+
+                if not offer_key:
+                    continue
+
+                group_to_rows.setdefault(offer_key, []).append(row_index)
+
+            return rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows
+
+        rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows = build_campaign_offer_group_map()
+        duplicate_groups = {k: v for k, v in group_to_rows.items() if len(v) > 1}
+        if not duplicate_groups:
+            self.log_manage("  未发现需要写入统计行的YP广告系列相同offer分组")
+            return
+
+        self.log_manage(f"  发现 {len(duplicate_groups)} 组YP广告系列相同offer，开始整理")
+
+        group_order = sorted(
+            duplicate_groups.keys(),
+            key=lambda key: min(group_to_rows.get(key, [10**9]))
+        )
+
+        for offer_key in group_order:
+            rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows = build_campaign_offer_group_map()
+            rows = sorted(group_to_rows.get(offer_key, []))
+            if len(rows) <= 1:
+                continue
+
+            target = rows[0]
+            desired = list(range(target, target + len(rows)))
+            if rows != desired:
+                working_order = list(ordered_rows)
+                data_start_0based = 1
+                for offset, row_index in enumerate(rows):
+                    current_pos = working_order.index(row_index)
+                    desired_pos = working_order.index(target) + offset
+                    if current_pos == desired_pos:
+                        continue
+                    src_0based = data_start_0based + current_pos
+                    dst_0based = data_start_0based + desired_pos
+                    if not self.feishu_move_dimension(token, spreadsheet_token, sheet_id, src_0based, src_0based, dst_0based):
+                        raise RuntimeError(f"无法整理广告系列分组 {offer_key}")
+                    moved = working_order.pop(current_pos)
+                    working_order.insert(desired_pos, moved)
+
+                rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows = build_campaign_offer_group_map()
+                rows = sorted(group_to_rows.get(offer_key, rows))
+                target = rows[0]
+
+            summary_row_index = summary_rows.get(offer_key)
+            if summary_row_index is None or summary_row_index != target - 1:
+                summary_row_index = target
+                if not self.insert_sheet_rows(token, spreadsheet_token, sheet_id, start_index_0based=target - 1, count=1):
+                    raise RuntimeError(f"无法为广告系列分组 {offer_key} 插入统计行")
+                rows = [ri + 1 if ri >= summary_row_index else ri for ri in rows]
+                rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows = build_campaign_offer_group_map()
+
+            asin, brand_id, country = offer_key
+            offer_summary = yp_offer_context.get('offer_group_summary_by_key', {}).get(offer_key, {}) or {}
+            metrics = self.summarize_campaign_group_rows(row_by_index, rows)
+            total_cost = metrics.get('total_cost', 0.0)
+            total_commission = metrics.get('total_commission', 0.0)
+            if total_commission <= 0 and offer_summary:
+                total_commission = float(offer_summary.get('commission', 0.0) or 0.0)
+            total_clicks = metrics.get('total_clicks', 0)
+            roi_value = round(total_commission / total_cost, 1) if total_cost > 0 else 0
+            summary_label = f"{asin} | {brand_id} | {country}"
+            updates = []
+            style_updates = []
+            summary_values = {
+                '状态': SUMMARY_STATUS_TEXT,
+                '广告系列名称': summary_label,
+                '广告系列总花费': f"${total_cost:.2f}" if total_cost else '',
+                '总佣金': f"${total_commission:.2f}" if total_commission else '',
+                'ROI': f"{roi_value}",
+                '总点击数': total_clicks if total_clicks else '',
+                '佣金ASIN': ', '.join(metrics.get('commission_asins', [])),
+                '品牌收支平衡CPC': metrics.get('brand_break_even_cpc', ''),
+                '新增广告系列花费': f"${metrics.get('increment_cost', 0.0):.2f}" if metrics.get('increment_cost', 0.0) else '',
+                '新增佣金': f"${metrics.get('increment_commission', 0.0):.2f}" if metrics.get('increment_commission', 0.0) else '',
+            }
+            preserved_headers = set(summary_values.keys())
+
+            for header, col_letter in column_map.items():
+                col_idx = self.column_letter_to_index(col_letter)
+                if col_idx is None:
+                    continue
+                value = summary_values.get(header, SUMMARY_PLACEHOLDER_TEXT if header not in preserved_headers else '')
+                updates.append((summary_row_index, col_idx, value))
+
+            if '状态' in column_map:
+                style_updates.append({
+                    'row_index': summary_row_index,
+                    'color': 'deep_pink',
+                    'column': column_map.get('状态', 'A')
+                })
+
+            commission_col_letter = column_map.get('总佣金')
+            commission_col_idx = self.column_letter_to_index(commission_col_letter) if commission_col_letter else None
+            if commission_col_idx is not None:
+                for row_index in rows:
+                    updates.append((row_index, commission_col_idx, '↑'))
+
+            self._batch_update_sheet_cells(token, spreadsheet_token, updates, sheet_id=sheet_id)
+            if style_updates:
+                self.apply_campaigns_style_updates(token, spreadsheet_token, sheet_id, style_updates)
+
+            self.log_manage(
+                f"    已生成广告系列统计行: ASIN={asin}, 品牌ID={brand_id or '-'}, 国家={country}, 汇总{len(rows)}个广告系列"
+            )
     
     def get_all_campaigns_with_asin(self, start_date_str=None, end_date_str=None):
         """获取所有广告系列及其ASIN（从广告层级的最终到达网址提取）
@@ -3979,7 +5732,11 @@ class OfferToolApp:
                                 'final_urls': [],
                                 'final_url_suffix': c.final_url_suffix if c.final_url_suffix else '',
                                 'link_ids': set(),
-                                'uids': set()
+                                'uids': set(),
+                                'clicks': 0,
+                                'avg_cpc_usd': 0.0,
+                                'enabled_keyword_ctr_weighted_numerator': 0.0,
+                                'enabled_keyword_ctr_impressions': 0
                             }
 
                     # 查询广告层级，获取最终到达网址，补充ASIN / uid / link_id。
@@ -4017,7 +5774,11 @@ class OfferToolApp:
                                 'final_urls': [],
                                 'final_url_suffix': c.final_url_suffix if c.final_url_suffix else '',
                                 'link_ids': set(),
-                                'uids': set()
+                                'uids': set(),
+                                'clicks': 0,
+                                'avg_cpc_usd': 0.0,
+                                'enabled_keyword_ctr_weighted_numerator': 0.0,
+                                'enabled_keyword_ctr_impressions': 0
                             }
                         
                         # 从广告的最终到达网址提取ASIN
@@ -4067,7 +5828,9 @@ class OfferToolApp:
                     cost_query = """
                         SELECT
                             campaign.id,
-                            metrics.cost_micros
+                            metrics.cost_micros,
+                            metrics.clicks,
+                            metrics.average_cpc
                         FROM campaign
                         WHERE campaign.status != 'REMOVED'
                     """
@@ -4086,9 +5849,47 @@ class OfferToolApp:
                         cost_in_original = row.metrics.cost_micros / 1000000 if row.metrics.cost_micros else 0
                         if account_currency == 'CNY':
                             cost_in_usd = cost_in_original * CNY_TO_USD_RATE
+                            avg_cpc_in_usd = (row.metrics.average_cpc / 1000000) * CNY_TO_USD_RATE if row.metrics.average_cpc else 0
                         else:
                             cost_in_usd = cost_in_original
+                            avg_cpc_in_usd = (row.metrics.average_cpc / 1000000) if row.metrics.average_cpc else 0
                         campaign_info[campaign_id]['cost_usd'] += cost_in_usd
+                        campaign_info[campaign_id]['clicks'] += int(row.metrics.clicks or 0)
+                        if avg_cpc_in_usd > 0:
+                            campaign_info[campaign_id]['avg_cpc_usd'] = avg_cpc_in_usd
+
+                    # 查询关键词层级指标，汇总“启用且有点击”的关键词CTR加权平均所需数据
+                    keyword_query = """
+                        SELECT
+                            campaign.id,
+                            metrics.impressions,
+                            metrics.clicks,
+                            metrics.ctr
+                        FROM keyword_view
+                        WHERE campaign.status != 'REMOVED'
+                            AND ad_group.status != 'REMOVED'
+                            AND ad_group_criterion.status = 'ENABLED'
+                    """
+                    if start_date_str and end_date_str:
+                        keyword_query += f"""
+                            AND segments.date >= '{start_date_str}'
+                            AND segments.date <= '{end_date_str}'
+                        """
+
+                    keyword_response = ga_service.search(customer_id=account['id'], query=keyword_query)
+                    for row in keyword_response:
+                        campaign_id = str(row.campaign.id)
+                        if campaign_id not in campaign_info:
+                            continue
+
+                        clicks = int(row.metrics.clicks or 0)
+                        if clicks <= 0:
+                            continue
+
+                        impressions = int(row.metrics.impressions or 0)
+                        ctr = float(row.metrics.ctr or 0)
+                        campaign_info[campaign_id]['enabled_keyword_ctr_weighted_numerator'] += ctr * impressions
+                        campaign_info[campaign_id]['enabled_keyword_ctr_impressions'] += impressions
                     
                     # 将set转为list方便后续处理
                     for cinfo in campaign_info.values():
@@ -4114,8 +5915,9 @@ class OfferToolApp:
         
         匹配策略（按优先级）：
         0. 产品链接匹配（最高优先级）：从offer行产品链接中提取aa_adgroupid，与广告系列的aa_adgroupid比较（一对一匹配）
-        1. 直接uid匹配：从Google Ads final URL提取的uid与飞书投放链接的uid比较
-        2. link_id匹配：通过PB API获取link_id，与Google Ads final URL中的aa_adgroupid比较
+        1. 混合平台分流：同ASIN+国家同时存在PB/YP时，未命中PB aa_adgroupid的campaign直接分配给YP行
+        2. 直接uid匹配：从Google Ads final URL提取的uid与飞书投放链接的uid比较
+        3. link_id匹配：通过PB API获取link_id，与Google Ads final URL中的aa_adgroupid比较
         
         返回:
             {row_index: [campaign_info, ...]} 精确匹配的映射
@@ -4147,40 +5949,72 @@ class OfferToolApp:
             return row_campaigns
         
         self.log_manage(f"    广告系列标识: {len(uid_to_campaigns)}个uid, {len(link_id_to_campaigns)}个link_id")
+
+        def normalize_link_cell(value):
+            if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+                return value[0].get('link', '') or value[0].get('text', '')
+            return value if isinstance(value, str) else ''
+
+        def extract_product_adgroupid(row):
+            product_link = normalize_link_cell(row.get('产品链接', ''))
+            if not product_link:
+                return ''
+            adgroupid_match = re.search(r'[?&]aa_adgroupid=([^&]+)', product_link)
+            return adgroupid_match.group(1) if adgroupid_match else ''
+
+        def extract_row_tracking_uid(row):
+            tracking_link = normalize_link_cell(row.get('投放链接', ''))
+            if not tracking_link:
+                return ''
+            row_uid = self.extract_tracking_uid_from_link(tracking_link)
+            if row_uid:
+                return row_uid
+            return tracking_link[-7:] if len(tracking_link) >= 7 else ''
+
+        def is_yp_offer_row(row):
+            tracking_link = normalize_link_cell(row.get('投放链接', ''))
+            if tracking_link and self._is_yp_tracking_link(tracking_link):
+                return True
+            product_link = normalize_link_cell(row.get('产品链接', ''))
+            return not bool(product_link)
         
         # 2. 策略零（最高优先级）：通过产品链接中的aa_adgroupid直接匹配
         # 每个投放链接重定向后的产品链接包含唯一的aa_adgroupid参数，与广告系列后缀一致
         if has_link_ids:
             product_link_matched = 0
-            for row in feishu_data:
-                row_index = row.get('row_index')
-                if row_index in row_campaigns:
-                    continue
-                
-                product_link = row.get('产品链接', '')
-                if isinstance(product_link, list) and len(product_link) > 0 and isinstance(product_link[0], dict):
-                    product_link = product_link[0].get('link', '') or product_link[0].get('text', '')
-                if not isinstance(product_link, str) or not product_link:
-                    continue
-                
-                # 从产品链接URL中提取aa_adgroupid参数
-                adgroupid_match = re.search(r'[?&]aa_adgroupid=([^&]+)', product_link)
-                if not adgroupid_match:
-                    continue
-                
-                row_adgroupid = adgroupid_match.group(1)
-                if row_adgroupid in link_id_to_campaigns:
-                    row_campaigns[row_index] = link_id_to_campaigns[row_adgroupid]
-                    product_link_matched += 1
-            
-            if product_link_matched:
-                self.log_manage(f"    ✓ 通过产品链接aa_adgroupid匹配: {product_link_matched} 行")
+        for row in feishu_data:
+            row_index = row.get('row_index')
+            if str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT:
+                continue
+            if row_index in row_campaigns:
+                continue
+
+            product_link = row.get('产品链接', '')
+            if isinstance(product_link, list) and len(product_link) > 0 and isinstance(product_link[0], dict):
+                product_link = product_link[0].get('link', '') or product_link[0].get('text', '')
+            if not isinstance(product_link, str) or not product_link:
+                continue
+
+            # 从产品链接URL中提取aa_adgroupid参数
+            adgroupid_match = re.search(r'[?&]aa_adgroupid=([^&]+)', product_link)
+            if not adgroupid_match:
+                continue
+
+            row_adgroupid = adgroupid_match.group(1)
+            if row_adgroupid in link_id_to_campaigns:
+                row_campaigns[row_index] = link_id_to_campaigns[row_adgroupid]
+                product_link_matched += 1
+
+        if has_link_ids and product_link_matched:
+            self.log_manage(f"    ✓ 通过产品链接aa_adgroupid匹配: {product_link_matched} 行")
         
         # 3. 找出所有需要精确匹配的(ASIN, 国家)组合
         # 不仅处理多行offer的组合，还处理所有有广告系列的组合
         # 这样才能为广告系列表建立完整的 campaign_id -> tracking_link 映射
         asin_country_rows = {}
         for row in feishu_data:
+            if str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT:
+                continue
             asin = row.get('ASIN', '') or ''
             country = self.normalize_country_code(row.get('国家代码', ''))
             if not asin or not country:
@@ -4201,10 +6035,81 @@ class OfferToolApp:
         
         multi_row_count = sum(1 for k in keys_to_match if len(asin_country_rows[k]) > 1)
         self.log_manage(f"    需要精确匹配: {len(keys_to_match)} 个(ASIN+国家)组合 (其中{multi_row_count}个有多行offer)")
-        
-        # 3. 策略一：直接用uid匹配（最快，无需API调用）
+
+        # 4. 混合平台专用分流：
+        # 对同ASIN+国家同时存在PB/YP的组合，先让PB通过产品链接aa_adgroupid命中；
+        # 剩余未命中的campaign直接分给YP行，避免后续按(ASIN+国家)回退时被PB误吸收。
+        mixed_platform_keys = set()
+        mixed_platform_pb_exact_matches = 0
+        mixed_platform_yp_assigned = 0
+        for key in keys_to_match:
+            rows = asin_country_rows[key]
+            yp_rows = [row for row in rows if is_yp_offer_row(row)]
+            pb_rows = [row for row in rows if not is_yp_offer_row(row)]
+            if not yp_rows or not pb_rows:
+                continue
+
+            mixed_platform_keys.add(key)
+
+            assigned_campaign_ids = set()
+            for row in rows:
+                for campaign in row_campaigns.get(row.get('row_index'), []):
+                    cid = str(campaign.get('campaign_id', '') or '').strip()
+                    if cid:
+                        assigned_campaign_ids.add(cid)
+            mixed_platform_pb_exact_matches += len(assigned_campaign_ids)
+
+            yp_row_uid_map = {}
+            for row in yp_rows:
+                row_index = row.get('row_index')
+                if not row_index:
+                    continue
+                row_uid = extract_row_tracking_uid(row)
+                if row_uid:
+                    yp_row_uid_map.setdefault(row_uid, []).append(row_index)
+
+            empty_product_link_yp_rows = [
+                row for row in yp_rows
+                if not normalize_link_cell(row.get('产品链接', ''))
+            ]
+
+            for campaign in asin_country_campaigns.get(key, []):
+                cid = str(campaign.get('campaign_id', '') or '').strip()
+                if cid and cid in assigned_campaign_ids:
+                    continue
+
+                target_row_index = None
+                for uid in campaign.get('uids', []) or []:
+                    uid_rows = yp_row_uid_map.get(uid, [])
+                    if len(uid_rows) == 1:
+                        target_row_index = uid_rows[0]
+                        break
+
+                if target_row_index is None:
+                    preferred_rows = empty_product_link_yp_rows or yp_rows
+                    if preferred_rows:
+                        target_row_index = preferred_rows[0].get('row_index')
+
+                if not target_row_index:
+                    continue
+
+                row_campaigns.setdefault(target_row_index, []).append(campaign)
+                if cid:
+                    assigned_campaign_ids.add(cid)
+                mixed_platform_yp_assigned += 1
+
+        if mixed_platform_keys:
+            self.log_manage(
+                f"    ✓ 混合平台分流: {len(mixed_platform_keys)} 个组合, "
+                f"PB aa_adgroupid命中 {mixed_platform_pb_exact_matches} 个广告系列, "
+                f"未命中PB改分配到YP {mixed_platform_yp_assigned} 个广告系列"
+            )
+
+        # 5. 策略一：直接用uid匹配（最快，无需API调用）
         uid_matched = 0
         for key in keys_to_match:
+            if key in mixed_platform_keys:
+                continue
             rows = asin_country_rows[key]
             for row in rows:
                 row_index = row.get('row_index')
@@ -4216,10 +6121,7 @@ class OfferToolApp:
                 if not isinstance(tracking_link, str) or not tracking_link:
                     continue
                 
-                row_uid = ''
-                uid_match = re.search(r'[?&]uid=([^&]+)', tracking_link)
-                if uid_match:
-                    row_uid = uid_match.group(1)
+                row_uid = self.extract_tracking_uid_from_link(tracking_link)
                 
                 if not row_uid:
                     continue
@@ -4232,11 +6134,12 @@ class OfferToolApp:
         if uid_matched:
             self.log_manage(f"    ✓ 通过uid直接匹配: {uid_matched} 行")
         
-        # 4. 策略二：对未匹配的行，通过PB API获取link_id匹配
+        # 6. 策略二：对未匹配的行，通过PB API获取link_id匹配
         if has_link_ids:
             unmatched_keys = {
                 key for key in keys_to_match
-                if any(row.get('row_index') not in row_campaigns for row in asin_country_rows[key])
+                if key not in mixed_platform_keys
+                and any(row.get('row_index') not in row_campaigns for row in asin_country_rows[key])
             }
             
             if unmatched_keys:
@@ -4261,11 +6164,8 @@ class OfferToolApp:
                         if not isinstance(tracking_link, str) or not tracking_link:
                             continue
                         
-                        row_uid = ''
-                        uid_m = re.search(r'[?&]uid=([^&]+)', tracking_link)
-                        if uid_m:
-                            row_uid = uid_m.group(1)
-                        elif len(tracking_link) >= 7:
+                        row_uid = self.extract_tracking_uid_from_link(tracking_link)
+                        if not row_uid and len(tracking_link) >= 7:
                             row_uid = tracking_link[-7:]
                         if not row_uid:
                             continue
@@ -4324,6 +6224,95 @@ class OfferToolApp:
         self.log_manage(f"    精确匹配总计: {total} 行")
         
         return row_campaigns
+
+    def get_removed_campaign_metrics(self, start_date_str=None, end_date_str=None, campaign_names=None):
+        """一次性汇总已移除广告系列的点击数与平均CPC。"""
+        removed_metrics = {}
+        target_names = {str(name).strip() for name in (campaign_names or []) if str(name).strip()}
+        if not target_names:
+            return removed_metrics
+
+        try:
+            client = self.get_google_ads_client()
+            if not client:
+                self.log_manage("  ✗ 无法创建Google Ads客户端，跳过已移除广告系列指标汇总")
+                return removed_metrics
+
+            ga_service = client.get_service('GoogleAdsService')
+            mcc_id = self.google_mcc_id_var.get().strip()
+
+            query = """
+                SELECT customer_client.id, customer_client.descriptive_name, customer_client.manager, customer_client.currency_code
+                FROM customer_client
+                WHERE customer_client.level <= 1
+            """
+            response = ga_service.search(customer_id=mcc_id, query=query)
+
+            sub_accounts = []
+            for row in response:
+                if not row.customer_client.manager:
+                    sub_accounts.append({
+                        'id': str(row.customer_client.id),
+                        'name': row.customer_client.descriptive_name,
+                        'currency': row.customer_client.currency_code
+                    })
+
+            CNY_TO_USD_RATE = 0.14
+            matched_count = 0
+
+            for account in sub_accounts:
+                if self.stop_flag:
+                    break
+
+                try:
+                    account_currency = account.get('currency', 'USD')
+                    removed_query = """
+                        SELECT
+                            campaign.id,
+                            campaign.name,
+                            metrics.clicks,
+                            metrics.average_cpc
+                        FROM campaign
+                        WHERE campaign.status = 'REMOVED'
+                    """
+                    if start_date_str and end_date_str:
+                        removed_query += f"""
+                            AND segments.date >= '{start_date_str}'
+                            AND segments.date <= '{end_date_str}'
+                        """
+
+                    removed_response = ga_service.search(customer_id=account['id'], query=removed_query)
+                    for row in removed_response:
+                        campaign_name = str(row.campaign.name or '').strip()
+                        if not campaign_name or campaign_name not in target_names:
+                            continue
+
+                        clicks = int(row.metrics.clicks or 0)
+                        avg_cpc_original = (row.metrics.average_cpc / 1000000) if row.metrics.average_cpc else 0.0
+                        avg_cpc_usd = avg_cpc_original * CNY_TO_USD_RATE if account_currency == 'CNY' else avg_cpc_original
+
+                        if campaign_name not in removed_metrics:
+                            removed_metrics[campaign_name] = {
+                                'clicks': 0,
+                                'cost_for_cpc': 0.0,
+                            }
+                            matched_count += 1
+
+                        removed_metrics[campaign_name]['clicks'] += clicks
+                        removed_metrics[campaign_name]['cost_for_cpc'] += avg_cpc_usd * clicks
+                except Exception as e:
+                    self.log_manage(f"  ⚠ 账户 {account['name']}({account['id']}) 汇总已移除广告系列指标失败: {str(e)[:100]}")
+
+            for campaign_name, item in removed_metrics.items():
+                clicks = int(item.get('clicks', 0) or 0)
+                total_cost = float(item.get('cost_for_cpc', 0.0) or 0.0)
+                item['avg_cpc_usd'] = (total_cost / clicks) if clicks > 0 else 0.0
+
+            self.log_manage(f"  已移除广告系列指标汇总完成: 命中 {matched_count} 个广告系列")
+        except Exception as e:
+            self.log_manage(f"  汇总已移除广告系列指标失败: {e}")
+
+        return removed_metrics
     
     def extract_asin_from_url(self, url):
         """从最终到达网址中提取ASIN"""
@@ -4376,6 +6365,55 @@ class OfferToolApp:
                 return match.group(1).upper()
         
         return None
+
+    def extract_brand_and_country_from_campaign_name(self, campaign_name):
+        """从广告系列名称中提取品牌名和国家代码。
+
+        示例:
+            Miir_DE_5801_9711_20260425162956454 -> (Miir, DE)
+            2037-2589-anker-US-Search-20260122205857 -> (anker, US)
+        """
+        if not campaign_name:
+            return None, None
+
+        country = self.extract_country_from_campaign_name(campaign_name)
+        if not country:
+            return None, None
+
+        tokens = [token.strip() for token in re.split(r'[-_]', str(campaign_name)) if str(token).strip()]
+        brand = None
+
+        for idx, token in enumerate(tokens):
+            if token.upper() != country:
+                continue
+
+            for left_idx in range(idx - 1, -1, -1):
+                candidate = tokens[left_idx].strip()
+                if not candidate:
+                    continue
+                if candidate.upper() == country:
+                    continue
+                if candidate.isdigit():
+                    continue
+                if not re.search(r'[A-Za-z]', candidate):
+                    continue
+                brand = candidate
+                break
+            if brand:
+                break
+
+        if not brand:
+            for candidate in tokens:
+                if candidate.upper() == country:
+                    break
+                if candidate.isdigit():
+                    continue
+                if not re.search(r'[A-Za-z]', candidate):
+                    continue
+                brand = candidate
+                break
+
+        return (brand, country) if brand and country else (None, country)
     
     def extract_country_from_merchant_name(self, merchant_name):
         """从品牌名称中提取国家代码
@@ -4788,8 +6826,79 @@ class OfferToolApp:
         self.log_manage(f"  API调用统计: {api_calls}次请求, {api_errors}次错误")
         
         return all_transactions
+
+    def get_all_yp_commissions(self, start_date_str, end_date_str):
+        """获取指定日期范围内的YeahPromos佣金数据。"""
+        yp_token = self.yp_token_var.get().strip()
+        yp_site_id = self.yp_site_id_var.get().strip()
+        if not yp_token or not yp_site_id:
+            self.log_manage("  未配置YP Token或Site ID，跳过YP佣金")
+            return []
+
+        all_transactions = []
+        page = 1
+        total_pages = None
+        api_calls = 0
+        api_errors = 0
+        url = f"{YP_API_BASE_URL}/index/Getorder/getorder"
+        headers = {"token": yp_token}
+
+        self.log_manage(f"  查询YP佣金数据，日期范围: {start_date_str} 到 {end_date_str}")
+
+        while True:
+            if self.stop_flag:
+                break
+
+            params = {
+                "site_id": yp_site_id,
+                "startDate": start_date_str,
+                "endDate": end_date_str,
+                "is_amazon": 1,
+                "page": page,
+                "limit": 1000,
+            }
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=60)
+                data = response.json()
+                api_calls += 1
+
+                if str(data.get("code", "")) != "100000":
+                    msg = data.get("msg") or data.get("message") or data.get("status") or "Unknown error"
+                    self.log_manage(f"  YP API返回错误: {msg}")
+                    api_errors += 1
+                    break
+
+                payload = data.get('data')
+                items = []
+                if isinstance(payload, list):
+                    items = payload
+                elif isinstance(payload, dict):
+                    for key in ('Data', 'data', 'list', 'orders', 'rows'):
+                        value = payload.get(key)
+                        if isinstance(value, list):
+                            items = value
+                            break
+                    if total_pages is None:
+                        total_pages = int(payload.get('PageTotal') or payload.get('pageTotal') or payload.get('total_page') or payload.get('totalPage') or 0)
+                if total_pages is None:
+                    total_pages = int(data.get('PageTotal') or data.get('pageTotal') or 0)
+
+                all_transactions.extend(items)
+                if not items:
+                    break
+                if total_pages and page >= total_pages:
+                    break
+                page += 1
+            except Exception as e:
+                self.log_manage(f"  YP API请求异常: {str(e)[:100]}")
+                api_errors += 1
+                break
+
+        self.log_manage(f"  YP API调用统计: {api_calls}次请求, {api_errors}次错误")
+        self.log_manage(f"  获取到 {len(all_transactions)} 条YP交易")
+        return all_transactions
     
-    def calculate_updates(self, feishu_data, asin_country_campaigns, asin_country_commission, asin_only_commission=None, asin_country_uid_commission=None, asin_country_no_uid_commission=None, row_campaigns=None):
+    def calculate_updates(self, feishu_data, asin_country_campaigns, asin_country_commission, asin_only_commission=None, asin_country_uid_commission=None, asin_country_no_uid_commission=None, row_campaigns=None, yp_asin_brand_commission=None):
         """计算需要更新的内容
         
         参数:
@@ -4814,18 +6923,27 @@ class OfferToolApp:
             asin_country_no_uid_commission = {}
         if row_campaigns is None:
             row_campaigns = {}
+        if yp_asin_brand_commission is None:
+            yp_asin_brand_commission = {}
         updates = []
         offer_row_commissions = {}
         
-        # 构建已被link_id精确匹配"认领"的广告系列ID集合
+        # 构建已被精确匹配认领的广告系列ID集合
         # 用于在回退到(ASIN+国家)匹配时，排除已认领的广告系列
         claimed_campaign_ids = set()
-        for row_idx, row_cams in row_campaigns.items():
+        claimed_campaign_ids_by_key = {}
+        for row_cams in row_campaigns.values():
             for c in row_cams:
-                claimed_campaign_ids.add(c.get('campaign_id'))
-        
-        # 获取所有正在投放的(ASIN, 国家)组合
-        active_keys = set(asin_country_campaigns.keys())
+                cid = c.get('campaign_id')
+                if not cid:
+                    continue
+                claimed_campaign_ids.add(cid)
+                campaign_key = (
+                    str(c.get('asin', '') or '').strip(),
+                    self.normalize_country_code(c.get('country', '') or '')
+                )
+                if campaign_key[0] and campaign_key[1]:
+                    claimed_campaign_ids_by_key.setdefault(campaign_key, set()).add(cid)
         
         # 第一遍遍历：构建每个(ASIN, 国家)组合的状态分布
         # 用于判断佣金应该更新到哪一行
@@ -4851,13 +6969,15 @@ class OfferToolApp:
             link = normalize_link_value(value)
             if not link:
                 return ''
-            uid_match = re.search(r'[?&]uid=([^&]+)', link)
-            if uid_match:
-                return uid_match.group(1)
+            uid = self.extract_tracking_uid_from_link(link)
+            if uid:
+                return uid
             return link[-7:] if len(link) >= 7 else link
 
         # 记录每行的uid
         row_uid_map = {}  # {row_index: uid}
+        row_is_yp_map = {}  # {row_index: bool}
+        asin_country_platforms = {}  # {(asin, country): {'pb', 'yp'}}
         exact_uid_row_candidates = {}  # {(asin, country, uid): [row_index, ...]}
         # 记录每个(asin, country)有多少个不同的投放链接（用于判断是否有复制的offer）
         asin_country_uids = {}  # {(asin, country): [uid1, uid2, ...]}
@@ -4869,12 +6989,14 @@ class OfferToolApp:
             row_index = row.get('row_index')
             tracking_link = row.get('投放链接', '')
             
-            if not asin:
+            if not asin or str(current_status or '').strip() == SUMMARY_STATUS_TEXT:
                 continue
             
             # 提取投放链接的uid
             row_uid = extract_tracking_uid(tracking_link)
             row_uid_map[row_index] = row_uid
+            row_is_yp = self._is_yp_tracking_link(normalize_link_value(tracking_link))
+            row_is_yp_map[row_index] = row_is_yp
             
             # 统计每个ASIN的出现次数
             if asin not in asin_row_count:
@@ -4898,6 +7020,8 @@ class OfferToolApp:
             key = (asin, country) if country else None
             if not key:
                 continue
+
+            asin_country_platforms.setdefault(key, set()).add('yp' if row_is_yp else 'pb')
             
             # 记录每个(asin, country)的uid列表
             if key not in asin_country_uids:
@@ -4924,11 +7048,23 @@ class OfferToolApp:
         preserved_offer_cost_rows = []
         precomputed_row_commissions = {}
 
-        def get_fallback_row_for_key(key):
+        mixed_platform_keys = {
+            key for key, platforms in asin_country_platforms.items()
+            if len(platforms) > 1
+        }
+
+        def get_fallback_row_for_key(key, preferred_platform=None):
             rows_info = asin_country_rows.get(key, {})
             for bucket in ('active_rows', 'ended_rows', 'untested_rows'):
                 bucket_rows = rows_info.get(bucket, [])
-                if bucket_rows:
+                if preferred_platform:
+                    platform_rows = [
+                        row_index for row_index in bucket_rows
+                        if ('yp' if row_is_yp_map.get(row_index) else 'pb') == preferred_platform
+                    ]
+                    if platform_rows:
+                        return platform_rows[0]
+                elif bucket_rows:
                     return bucket_rows[0]
             return None
 
@@ -4943,6 +7079,9 @@ class OfferToolApp:
                     'uid_allocations': [],
                     'non_uid_commission': 0.0,
                     'asin_only_commission': 0.0,
+                    'yp_commission': 0.0,
+                    'yp_gross_commission': 0.0,
+                    'yp_rejected_commission': 0.0,
                 }
             return precomputed_row_commissions[row_index]
 
@@ -4961,7 +7100,7 @@ class OfferToolApp:
                 })
                 continue
 
-            fallback_row = get_fallback_row_for_key((asin, country))
+            fallback_row = get_fallback_row_for_key((asin, country), preferred_platform='pb')
             if fallback_row is not None:
                 result = get_or_create_row_commission(fallback_row, asin, country)
                 result['total'] += commission_value
@@ -4983,7 +7122,7 @@ class OfferToolApp:
 
         allocated_no_uid_keys = set()
         for key, commission_value in asin_country_no_uid_commission.items():
-            fallback_row = get_fallback_row_for_key(key)
+            fallback_row = get_fallback_row_for_key(key, preferred_platform='pb')
             if fallback_row is None:
                 continue
             result = get_or_create_row_commission(fallback_row, key[0], key[1])
@@ -5000,7 +7139,7 @@ class OfferToolApp:
             target_key = None
             target_row = None
             for key in asin_candidate_keys.get(asin, []):
-                row_index = get_fallback_row_for_key(key)
+                row_index = get_fallback_row_for_key(key, preferred_platform='pb')
                 if row_index is not None:
                     target_key = key
                     target_row = row_index
@@ -5012,6 +7151,36 @@ class OfferToolApp:
             result['asin_only_commission'] += commission_value
             result['used_asin_only_match'] = True
 
+        yp_duplicate_groups = {}
+        for row in feishu_data:
+            row_index = row.get('row_index')
+            if not row_index or row_index <= 2:
+                continue
+            status = str(row.get('状态', '') or '').strip()
+            if status == SUMMARY_STATUS_TEXT:
+                continue
+            asin = str(row.get('ASIN', '') or '').strip()
+            brand_id = str(row.get('品牌ID', '') or '').strip()
+            tracking_link = str(normalize_link_value(row.get('投放链接', '')) or '').strip()
+            if not asin or not brand_id or not self._is_yp_tracking_link(tracking_link):
+                continue
+            yp_duplicate_groups.setdefault((asin, brand_id), []).append(row_index)
+
+        for yp_key, yp_info in yp_asin_brand_commission.items():
+            row_indices = yp_duplicate_groups.get(yp_key, [])
+            if not row_indices:
+                continue
+            target_row = min(row_indices)
+            target_row_data = next((r for r in feishu_data if r.get('row_index') == target_row), None)
+            if not target_row_data:
+                continue
+            target_country = self.normalize_country_code(target_row_data.get('国家代码', '') or '')
+            result = get_or_create_row_commission(target_row, yp_key[0], target_country)
+            result['total'] += yp_info.get('non_rejected', 0.0)
+            result['yp_commission'] += yp_info.get('non_rejected', 0.0)
+            result['yp_gross_commission'] += yp_info.get('gross', 0.0)
+            result['yp_rejected_commission'] += yp_info.get('rejected', 0.0)
+
         def get_commission_for_row(asin, country, row_index, is_first_offer):
             """获取某行的佣金归因结果。"""
             result = precomputed_row_commissions.get(row_index)
@@ -5022,6 +7191,9 @@ class OfferToolApp:
                     'uid_allocations': [],
                     'non_uid_commission': 0.0,
                     'asin_only_commission': 0.0,
+                    'yp_commission': 0.0,
+                    'yp_gross_commission': 0.0,
+                    'yp_rejected_commission': 0.0,
                 }
 
             return {
@@ -5030,13 +7202,20 @@ class OfferToolApp:
                 'uid_allocations': list(result.get('uid_allocations', [])),
                 'non_uid_commission': result.get('non_uid_commission', 0.0) or 0.0,
                 'asin_only_commission': result.get('asin_only_commission', 0.0) or 0.0,
+                'yp_commission': result.get('yp_commission', 0.0) or 0.0,
+                'yp_gross_commission': result.get('yp_gross_commission', 0.0) or 0.0,
+                'yp_rejected_commission': result.get('yp_rejected_commission', 0.0) or 0.0,
             }
+
+        def apply_mixed_platform_yp_cleanup(update):
+            update['ads_ids'] = ''
+            update['campaign_count'] = ''
+            update['campaign_names'] = ''
+            update['clear_total_cost'] = True
 
         def store_offer_row_commission(row_data, asin, country, row_index, commission_result, campaigns=None):
             """记录offer行级佣金归因结果，供广告系列表复用。"""
             commission_value = commission_result.get('total')
-            if commission_value is None:
-                return
 
             campaign_names = []
             campaign_ids = []
@@ -5054,11 +7233,17 @@ class OfferToolApp:
                 if isinstance(existing_campaign_names, str) and existing_campaign_names.strip():
                     campaign_names = [name.strip() for name in existing_campaign_names.split(',') if name.strip()]
 
+            if commission_value is None and not campaign_names and not campaign_ids:
+                return
+
             offer_row_commissions[row_index] = {
                 'row_index': row_index,
                 'asin': asin,
                 'country': country,
-                'commission': round(commission_value, 2),
+                'brand_id': str(row_data.get('品牌ID', '') or '').strip(),
+                'brand_name': str(row_data.get('品牌名称', '') or '').strip(),
+                'is_yp': self._is_yp_tracking_link(normalize_link_value(row_data.get('投放链接', ''))),
+                'commission': round(commission_value or 0.0, 2),
                 'tracking_link': normalize_link_value(row_data.get('投放链接', '')),
                 'campaign_names': campaign_names,
                 'campaign_ids': campaign_ids,
@@ -5066,6 +7251,9 @@ class OfferToolApp:
                 'non_uid_commission': commission_result.get('non_uid_commission', 0.0) or 0.0,
                 'asin_only_commission': commission_result.get('asin_only_commission', 0.0) or 0.0,
                 'used_asin_only_match': commission_result.get('used_asin_only_match', False),
+                'yp_commission': commission_result.get('yp_commission', 0.0) or 0.0,
+                'yp_gross_commission': commission_result.get('yp_gross_commission', 0.0) or 0.0,
+                'yp_rejected_commission': commission_result.get('yp_rejected_commission', 0.0) or 0.0,
             }
         
         # 记录每个(asin, country)已处理的行数，用于判断是否是第一个offer
@@ -5080,6 +7268,8 @@ class OfferToolApp:
             else:
                 self.log_debug(f"  ✗ {campaign_key[0]}_{campaign_key[1]}: 未在offer表格中找到")
         
+        mixed_platform_fallback_skips = 0
+
         # 第二遍遍历：处理更新
         for row in feishu_data:
             row_index = row.get('row_index')
@@ -5087,7 +7277,7 @@ class OfferToolApp:
             country = row.get('国家代码', '')
             current_status = row.get('状态', '')
             
-            if not asin:
+            if not asin or str(current_status or '').strip() == SUMMARY_STATUS_TEXT:
                 continue
             
             # 标准化国家代码
@@ -5095,6 +7285,7 @@ class OfferToolApp:
                 country = self.normalize_country_code(country)
             
             key = (asin, country) if country else None
+            row_is_yp = row_is_yp_map.get(row_index, False)
             
             # 记录当前行是否是该(asin, country)的第一个offer
             if key:
@@ -5117,6 +7308,7 @@ class OfferToolApp:
                     commission_result = get_commission_for_row(asin, country, row_index, is_first_offer)
                     commission_value = commission_result.get('total')
                     used_asin_only_match = commission_result.get('used_asin_only_match', False)
+                    needs_mixed_yp_cleanup = bool(row_is_yp and key in mixed_platform_keys)
 
                     if commission_value is not None:
                         commission_display = round(commission_value, 2)
@@ -5129,8 +7321,14 @@ class OfferToolApp:
                             'country': country,
                             'commission': commission_display
                         }
+                        if needs_mixed_yp_cleanup:
+                            apply_mixed_platform_yp_cleanup(update)
                         updates.append(update)
                         store_offer_row_commission(row, asin, country, row_index, commission_result, [])
+                    elif needs_mixed_yp_cleanup:
+                        update = {'row_index': row_index, 'asin': asin, 'country': country}
+                        apply_mixed_platform_yp_cleanup(update)
+                        updates.append(update)
                     # 没有广告系列，跳过其他处理
                     continue
             
@@ -5146,6 +7344,7 @@ class OfferToolApp:
                     commission_result = get_commission_for_row(asin, country, row_index, is_first_offer)
                     commission_value = commission_result.get('total')
                     used_asin_only_match = commission_result.get('used_asin_only_match', False)
+                    needs_mixed_yp_cleanup = bool(row_is_yp and key in mixed_platform_keys)
 
                     if commission_value is not None:
                         commission_display = round(commission_value, 2)
@@ -5158,12 +7357,19 @@ class OfferToolApp:
                             'country': country,
                             'commission': commission_display
                         }
+                        if needs_mixed_yp_cleanup:
+                            apply_mixed_platform_yp_cleanup(update)
                         updates.append(update)
                         store_offer_row_commission(row, asin, country, row_index, commission_result, [])
+                    elif needs_mixed_yp_cleanup:
+                        update = {'row_index': row_index, 'asin': asin, 'country': country}
+                        apply_mixed_platform_yp_cleanup(update)
+                        updates.append(update)
                     # 跳过其他处理（未测试且没有广告系列，不更新状态等）
                     continue
             
             update = {'row_index': row_index, 'asin': asin, 'country': country}
+            skipped_by_mixed_platform_guard = False
             
             # 优先使用link_id精确匹配的广告系列，否则回退到(ASIN+国家)匹配
             has_precise_match = row_index in row_campaigns
@@ -5171,12 +7377,19 @@ class OfferToolApp:
             if has_precise_match:
                 campaigns = row_campaigns[row_index]
             elif key and key in asin_country_campaigns:
-                # 回退到(ASIN+国家)匹配，但排除已被其他行精确认领的广告系列
-                all_campaigns = asin_country_campaigns[key]
-                if claimed_campaign_ids:
-                    campaigns = [c for c in all_campaigns if c.get('campaign_id') not in claimed_campaign_ids]
+                if key in mixed_platform_keys:
+                    campaigns = []
+                    if row_is_yp:
+                        skipped_by_mixed_platform_guard = True
+                        mixed_platform_fallback_skips += 1
                 else:
-                    campaigns = all_campaigns
+                # 回退到(ASIN+国家)匹配，但排除已被其他行精确认领的广告系列
+                    all_campaigns = asin_country_campaigns[key]
+                    key_claimed_ids = claimed_campaign_ids_by_key.get(key, set())
+                    if key_claimed_ids:
+                        campaigns = [c for c in all_campaigns if c.get('campaign_id') not in key_claimed_ids]
+                    else:
+                        campaigns = list(all_campaigns)
             else:
                 campaigns = []
             
@@ -5225,6 +7438,13 @@ class OfferToolApp:
                     update['total_cost'] = round(total_cost, 2)
                 # 多个广告系列名称用逗号分隔
                 update['campaign_names'] = ', '.join(campaign_names)
+                if not has_precise_match and key:
+                    claimed_ids = claimed_campaign_ids_by_key.setdefault(key, set())
+                    for c in campaigns:
+                        cid = c.get('campaign_id')
+                        if cid:
+                            claimed_ids.add(cid)
+                            claimed_campaign_ids.add(cid)
                 
             else:
                 # 这个ASIN+国家组合没有广告系列
@@ -5235,7 +7455,10 @@ class OfferToolApp:
                     update['ads_ids'] = ''
                     update['campaign_count'] = ''
                     update['campaign_names'] = ''  # 同时清空广告系列名称
-                    update['total_cost'] = None  # 保留原有花费数据
+                    if skipped_by_mixed_platform_guard:
+                        update['clear_total_cost'] = True
+                    else:
+                        update['total_cost'] = None  # 保留原有花费数据
                 else:
                     # 未测试或新复制状态，不更新
                     continue
@@ -5251,6 +7474,10 @@ class OfferToolApp:
                 if used_asin_only_match and len(asin_countries.get(asin, set())) > 1:
                     commission_display = f"{commission_display}*"
                 update['commission'] = commission_display
+
+            if campaigns:
+                store_offer_row_commission(row, asin, country, row_index, commission_result, campaigns)
+            elif commission_value is not None:
                 store_offer_row_commission(row, asin, country, row_index, commission_result, campaigns)
 
             updates.append(update)
@@ -5291,11 +7518,17 @@ class OfferToolApp:
                 )
             if len(preserved_offer_cost_rows) > 3:
                 self.log_manage(f"    ... 还有 {len(preserved_offer_cost_rows) - 3} 行未显示")
+
+        if mixed_platform_fallback_skips:
+            self.log_manage(
+                f"  混合平台保护: 跳过 {mixed_platform_fallback_skips} 行 YP Offer 的(ASIN+国家)广告系列回退匹配，避免PB/YP串行"
+            )
         
         commission_context = {
             'row_commissions': offer_row_commissions,
             'uid_fallback_events': uid_fallback_events,
             'unresolved_uid_commissions': unresolved_uid_commissions,
+            'yp_duplicate_groups': {k: v for k, v in yp_duplicate_groups.items() if len(v) > 1},
         }
         return updates, commission_context
     
@@ -5386,12 +7619,18 @@ class OfferToolApp:
                     })
                 
                 # 广告系列总花费列
-                if 'total_cost' in update and update['total_cost'] is not None and '广告系列总花费' in column_map:
+                if '广告系列总花费' in column_map:
                     col = column_map['广告系列总花费']
-                    value_ranges.append({
-                        'range': f"{sheet_id}!{col}{row_index}:{col}{row_index}",
-                        'values': [[f"${update['total_cost']}"]]
-                    })
+                    if update.get('clear_total_cost'):
+                        value_ranges.append({
+                            'range': f"{sheet_id}!{col}{row_index}:{col}{row_index}",
+                            'values': [['']]
+                        })
+                    elif 'total_cost' in update and update['total_cost'] is not None:
+                        value_ranges.append({
+                            'range': f"{sheet_id}!{col}{row_index}:{col}{row_index}",
+                            'values': [[f"${update['total_cost']}"]]
+                        })
                 
                 # 总佣金列
                 if 'commission' in update and '总佣金' in column_map:
@@ -5447,7 +7686,8 @@ class OfferToolApp:
         color_map = {
             'green': '#00AA00',    # 绿色
             'orange': '#FF8C00',   # 橙色
-            'black': '#333333'     # 深灰/黑色
+            'black': '#333333',    # 深灰/黑色
+            'deep_pink': '#C71585' # 深粉色
         }
         
         # 按颜色分组
@@ -5629,6 +7869,7 @@ class OfferToolApp:
 
         daily_costs = self.get_mcc_daily_costs(start_date_str, end_date_str)
         commission_data = self.get_all_commissions(start_date_str, end_date_str)
+        yp_commission_data = self.get_all_yp_commissions(start_date_str, end_date_str)
 
         daily_commissions = {}
         for trans in commission_data:
@@ -5639,6 +7880,28 @@ class OfferToolApp:
             if str(order_time).isdigit():
                 day = datetime.fromtimestamp(int(order_time)).strftime('%Y-%m-%d')
             else:
+                continue
+
+            comm = float(trans.get('sale_comm', 0) or 0)
+            daily_commissions[day] = daily_commissions.get(day, 0) + comm
+
+        for trans in yp_commission_data:
+            if str(trans.get('status', '') or '').strip().lower() == 'rejected':
+                continue
+
+            order_time = trans.get('creationDate_time', '') or trans.get('creationDate', '')
+            day = ''
+            if isinstance(order_time, (int, float)) or str(order_time).isdigit():
+                try:
+                    day = datetime.fromtimestamp(int(order_time)).strftime('%Y-%m-%d')
+                except Exception:
+                    day = ''
+            if not day and order_time:
+                try:
+                    day = datetime.strptime(str(order_time)[:19], '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
+                except Exception:
+                    day = str(order_time)[:10] if len(str(order_time)) >= 10 else ''
+            if not day:
                 continue
 
             comm = float(trans.get('sale_comm', 0) or 0)
@@ -5724,6 +7987,165 @@ class OfferToolApp:
         except Exception as e:
             self.log_manage(f"  更新总计行异常: {e}")
 
+    def consolidate_yp_duplicate_offer_rows(self, token, matched_keys=None):
+        """整理并汇总YP重复offer行。"""
+        spreadsheet_token = self.feishu_spreadsheet_var.get().strip()
+        sheet_id = self.feishu_sheet_id_var.get().strip()
+        matched_keys = set(matched_keys or [])
+
+        feishu_data = self.get_feishu_sheet_data(token)
+        groups = self.build_offer_row_groups(feishu_data)
+        duplicate_groups = {
+            key: rows for key, rows in groups.get('yp_asin_brand_rows', {}).items()
+            if len(rows) > 1 and (not matched_keys or key in matched_keys)
+        }
+        if not duplicate_groups:
+            self.log_manage("  未发现需要汇总的YP重复offer")
+            return
+
+        self.log_manage(f"  发现 {len(duplicate_groups)} 组YP重复offer，开始整理")
+        sorted_keys = [key for key, _ in sorted(duplicate_groups.items(), key=lambda item: min(item[1]))]
+
+        for key in sorted_keys:
+            feishu_data = self.get_feishu_sheet_data(token)
+            raw_row_by_index = {row.get('row_index'): row for row in feishu_data if row.get('row_index')}
+            groups = self.build_offer_row_groups(feishu_data)
+            row_order = list(groups.get('row_sequence', []))
+            row_by_index = groups.get('row_by_index', {})
+            rows = sorted(groups.get('yp_asin_brand_rows', {}).get(key, []))
+            if len(rows) <= 1:
+                continue
+
+            target = rows[0]
+            desired = list(range(target, target + len(rows)))
+            if rows != desired:
+                working_order = list(row_order)
+                data_start_0based = 2
+                for offset, row_index in enumerate(rows):
+                    current_pos = working_order.index(row_index)
+                    desired_pos = working_order.index(target) + offset
+                    if current_pos == desired_pos:
+                        continue
+                    src_0based = data_start_0based + current_pos
+                    dst_0based = data_start_0based + desired_pos
+                    if not self.feishu_move_dimension(token, spreadsheet_token, sheet_id, src_0based, src_0based, dst_0based):
+                        raise RuntimeError(f"无法整理重复offer分组 {key}")
+                    moved = working_order.pop(current_pos)
+                    working_order.insert(desired_pos, moved)
+                feishu_data = self.get_feishu_sheet_data(token)
+                raw_row_by_index = {row.get('row_index'): row for row in feishu_data if row.get('row_index')}
+                groups = self.build_offer_row_groups(feishu_data)
+                row_by_index = groups.get('row_by_index', {})
+                rows = sorted(groups.get('yp_asin_brand_rows', {}).get(key, rows))
+                target = rows[0]
+
+            existing_summary_row = raw_row_by_index.get(target - 1)
+            if (
+                existing_summary_row
+                and str(existing_summary_row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT
+                and str(existing_summary_row.get('ASIN', '') or '').strip() == key[0]
+                and str(existing_summary_row.get('品牌ID', '') or '').strip() == str(key[1])
+            ):
+                summary_row_index = target - 1
+            else:
+                summary_row_index = target
+                if not self.insert_sheet_rows(token, spreadsheet_token, sheet_id, start_index_0based=target - 1, count=1):
+                    raise RuntimeError(f"无法为重复offer分组 {key} 插入统计行")
+                feishu_data = self.get_feishu_sheet_data(token)
+                groups = self.build_offer_row_groups(feishu_data)
+                row_by_index = groups.get('row_by_index', {})
+                rows = [ri + 1 if ri >= summary_row_index else ri for ri in rows]
+
+            column_map = getattr(self, 'feishu_column_map', {})
+            all_headers = [header for header, _ in sorted(column_map.items(), key=lambda item: self.get_column_index_by_header(item[0]) or 0)]
+            excluded_headers = {
+                '状态',
+                '广告系列数量', '广告系列名称', '广告系列总花费', '总佣金',
+                '国家代码', '品牌名称', 'ASIN', '品牌ID'
+            }
+            placeholder_headers = []
+            for header in all_headers:
+                if header in excluded_headers:
+                    continue
+                col_idx = self.get_column_index_by_header(header)
+                currency_idx = self.get_column_index_by_header('货币')
+                if col_idx is not None and currency_idx is not None and col_idx <= currency_idx:
+                    placeholder_headers.append(header)
+
+            updates = []
+            style_updates = []
+            summary_source = row_by_index.get(rows[0])
+            if not summary_source:
+                continue
+            total_campaign_count = 0
+            total_cost = 0.0
+            total_commission = 0.0
+            campaign_names = []
+
+            for row_index in rows:
+                row_data = row_by_index.get(row_index)
+                if not row_data:
+                    continue
+                count_value = row_data.get('广告系列数量', '')
+                try:
+                    if str(count_value).strip():
+                        total_campaign_count += int(float(str(count_value).replace(',', '').strip()))
+                except Exception:
+                    pass
+                total_cost += self.parse_commission_value(row_data.get('广告系列总花费', ''))
+                total_commission += self.parse_commission_value(row_data.get('总佣金', ''))
+                names_value = str(row_data.get('广告系列名称', '') or '').strip()
+                if names_value:
+                    campaign_names.extend([name.strip() for name in names_value.split(',') if name.strip()])
+
+            summary_values = {
+                '状态': SUMMARY_STATUS_TEXT,
+                '广告系列数量': total_campaign_count if total_campaign_count else '',
+                '广告系列名称': ', '.join(campaign_names),
+                '广告系列总花费': f"${total_cost:.2f}" if total_cost or campaign_names else '',
+                '总佣金': f"${total_commission:.2f}" if total_commission or campaign_names else '',
+                '国家代码': summary_source.get('国家代码', ''),
+                '品牌名称': summary_source.get('品牌名称', ''),
+                'ASIN': summary_source.get('ASIN', ''),
+                '品牌ID': summary_source.get('品牌ID', ''),
+            }
+
+            for header, value in summary_values.items():
+                col_idx = self.get_column_index_by_header(header)
+                if col_idx is not None:
+                    updates.append((summary_row_index, col_idx, value))
+
+            for header in placeholder_headers:
+                col_idx = self.get_column_index_by_header(header)
+                if col_idx is not None:
+                    updates.append((summary_row_index, col_idx, SUMMARY_PLACEHOLDER_TEXT))
+
+            status_col_idx = self.get_column_index_by_header('状态')
+            if status_col_idx is not None:
+                style_updates.append({
+                    'row_index': summary_row_index,
+                    'color': 'deep_pink',
+                    'column': self.feishu_column_map.get('状态', 'A')
+                })
+
+            for row_index in rows:
+                for header in ('广告系列数量', '广告系列名称'):
+                    col_idx = self.get_column_index_by_header(header)
+                    if col_idx is not None:
+                        updates.append((row_index, col_idx, ''))
+                for header in ('广告系列总花费', '总佣金'):
+                    col_idx = self.get_column_index_by_header(header)
+                    if col_idx is not None:
+                        updates.append((row_index, col_idx, '↑'))
+
+            self._batch_update_sheet_cells(token, spreadsheet_token, updates)
+            if style_updates:
+                self.batch_update_cell_styles(token, spreadsheet_token, sheet_id, style_updates)
+
+            self.log_manage(
+                f"    已生成统计行: ASIN={key[0]}, 品牌ID={key[1]}, 汇总{len(rows)}行offer"
+            )
+
     # ==================== 表格行排序功能 ====================
     
     def parse_commission_value(self, val):
@@ -5808,6 +8230,7 @@ class OfferToolApp:
         
         # 定义状态优先级：投放中(0) > 暂停中(1) > 投放已结束(2) > 未测试(3)
         status_priority = {
+            SUMMARY_STATUS_TEXT: -1,
             '投放中': 0,
             '广告系列暂停中': 1,
             '暂停中': 1,
@@ -5936,6 +8359,10 @@ class OfferToolApp:
         if not feishu_data:
             self.log_manage("    无法读取Offer表格数据")
             return
+
+        if any(str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT for row in feishu_data):
+            self.log_manage("    检测到“相同offer统计行”，已跳过Offer表自动排序，避免打散汇总分组")
+            return
         
         # 找到最后一个有内容的数据行（排除总计行 row_index=2）
         last_data_ri = 0
@@ -5965,6 +8392,8 @@ class OfferToolApp:
         for ri in range(3, last_data_ri + 1):
             row = row_by_index.get(ri, {})
             status = str(row.get('状态', '') or '').strip()
+            if status == SUMMARY_STATUS_TEXT:
+                continue
             commission = self.parse_commission_value(row.get('总佣金', ''))
             data_rows.append({
                 'row_index': ri,
@@ -6005,6 +8434,10 @@ class OfferToolApp:
         
         if not existing_rows:
             self.log_manage("    广告系列表格无数据")
+            return
+
+        if any(str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT for row in existing_rows):
+            self.log_manage("    检测到“相同offer统计行”，已跳过广告系列表自动排序，避免打散汇总分组")
             return
         
         # 找到最后一个有内容的数据行
