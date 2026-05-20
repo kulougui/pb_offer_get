@@ -10,15 +10,24 @@ class BreakEvenCpcTests(unittest.TestCase):
         app.log_manage = lambda *args, **kwargs: None
         app.log_debug = lambda *args, **kwargs: None
         app._is_yp_tracking_link = OfferToolApp._is_yp_tracking_link.__get__(app, OfferToolApp)
+        app._is_pb_tracking_link = OfferToolApp._is_pb_tracking_link.__get__(app, OfferToolApp)
         app.normalize_sheet_cell_value = OfferToolApp.normalize_sheet_cell_value.__get__(app, OfferToolApp)
         app.extract_country_from_campaign_name = OfferToolApp.extract_country_from_campaign_name.__get__(app, OfferToolApp)
         app.extract_brand_and_country_from_campaign_name = OfferToolApp.extract_brand_and_country_from_campaign_name.__get__(app, OfferToolApp)
         app.normalize_country_code = OfferToolApp.normalize_country_code.__get__(app, OfferToolApp)
+        app.normalize_brand_key = OfferToolApp.normalize_brand_key.__get__(app, OfferToolApp)
+        app.campaign_name_matches_brand_country = OfferToolApp.campaign_name_matches_brand_country.__get__(app, OfferToolApp)
+        app.parse_commission_value = OfferToolApp.parse_commission_value.__get__(app, OfferToolApp)
+        app.extract_tracking_uid_from_link = OfferToolApp.extract_tracking_uid_from_link.__get__(app, OfferToolApp)
         app.build_yp_offer_group_context = OfferToolApp.build_yp_offer_group_context.__get__(app, OfferToolApp)
         app.resolve_yp_campaign_offer_group = OfferToolApp.resolve_yp_campaign_offer_group.__get__(app, OfferToolApp)
         app.summarize_campaign_group_rows = OfferToolApp.summarize_campaign_group_rows.__get__(app, OfferToolApp)
         app.apply_yp_group_commissions_to_campaign_rows = OfferToolApp.apply_yp_group_commissions_to_campaign_rows.__get__(app, OfferToolApp)
-        app.parse_commission_value = OfferToolApp.parse_commission_value.__get__(app, OfferToolApp)
+        app.build_copied_offer_tracking_link = OfferToolApp.build_copied_offer_tracking_link.__get__(app, OfferToolApp)
+        app.is_pb_offer_row = OfferToolApp.is_pb_offer_row.__get__(app, OfferToolApp)
+        app.build_copy_offer_match_key = OfferToolApp.build_copy_offer_match_key.__get__(app, OfferToolApp)
+        app.copy_offer_has_non_key_data = OfferToolApp.copy_offer_has_non_key_data.__get__(app, OfferToolApp)
+        app.format_brand_break_even_cpc = OfferToolApp.format_brand_break_even_cpc.__get__(app, OfferToolApp)
         return app
 
     def test_break_even_totals_should_combine_pb_and_yp_commission(self):
@@ -77,8 +86,8 @@ class BreakEvenCpcTests(unittest.TestCase):
         applied = app.apply_brand_break_even_cpc(updates, new_rows, mcc_campaigns, brand_country_totals)
 
         self.assertEqual(2, applied)
-        self.assertEqual('$1.00', updates[0]['品牌收支平衡CPC'])
-        self.assertEqual('$1.00', updates[1]['品牌收支平衡CPC'])
+        self.assertEqual('$1.00（$20.00/20）', updates[0]['品牌收支平衡CPC'])
+        self.assertEqual('$1.00（$20.00/20）', updates[1]['品牌收支平衡CPC'])
 
     def test_yp_country_resolution_requires_unique_offer_when_api_has_no_country(self):
         app = self.make_app()
@@ -184,6 +193,156 @@ class BreakEvenCpcTests(unittest.TestCase):
         self.assertEqual('$66.94', updates[0]['新增佣金'])
         self.assertEqual('6.7', updates[0]['ROI'])
         self.assertEqual('B0TEST0001_US', updates[0]['佣金ASIN'])
+
+    def test_build_copied_offer_tracking_link_should_keep_existing_yp_link(self):
+        app = self.make_app()
+        source_link = 'https://yeahpromos.com/track?pid=abc123&u1={tag1}'
+        app.generate_random_uid = lambda: self.fail('YP link should not request a new uid')
+        app.get_partnerboost_link = lambda asin, country, uid: self.fail('YP link should not call PB link API')
+
+        new_link, generated_new_link, uid = app.build_copied_offer_tracking_link('B0TEST0001', 'US', source_link)
+
+        self.assertEqual(source_link, new_link)
+        self.assertFalse(generated_new_link)
+        self.assertEqual('', uid)
+
+    def test_build_copied_offer_tracking_link_should_generate_new_pb_link(self):
+        app = self.make_app()
+        app.generate_random_uid = lambda: 'abc1234'
+        app.get_partnerboost_link = lambda asin, country, uid: f'https://pboost.me/link?asin={asin}&country={country}&uid={uid}'
+
+        new_link, generated_new_link, uid = app.build_copied_offer_tracking_link(
+            'B0TEST0001', 'US', 'https://pboost.me/original-link'
+        )
+
+        self.assertTrue(generated_new_link)
+        self.assertEqual('abc1234', uid)
+        self.assertEqual('https://pboost.me/link?asin=B0TEST0001&country=US&uid=abc1234', new_link)
+
+    def test_is_pb_offer_row_should_skip_non_pb_rows(self):
+        app = self.make_app()
+        col_indices = {'投放链接': 0, '状态': 1}
+
+        self.assertFalse(app.is_pb_offer_row(['https://yeahpromos.com/track?pid=abc123&u1={tag1}', ''], col_indices))
+        self.assertFalse(app.is_pb_offer_row(['https://pboost.me/abc123', '相同offer统计行'], col_indices))
+        self.assertTrue(app.is_pb_offer_row(['https://pboost.me/abc123', ''], col_indices))
+        self.assertFalse(app.is_pb_offer_row(['', ''], col_indices))
+
+    def test_is_pb_offer_row_should_require_explicit_pb_link(self):
+        app = self.make_app()
+        col_indices = {'投放链接': 0, '状态': 1}
+
+        self.assertFalse(app.is_pb_offer_row(['https://example.com/offer', ''], col_indices))
+        self.assertTrue(app.is_pb_offer_row(['https://www.pboost.me/abc123', ''], col_indices))
+
+    def test_offer_total_cost_should_write_zero_when_campaign_cost_is_zero(self):
+        app = self.make_app()
+        campaigns = [{
+            'cost_usd': 0.0,
+            'status': 'ENABLED',
+            'account_id': '123-456-7890',
+            'campaign_name': 'TestCampaign',
+            'campaign_id': '1',
+            'asin': 'B0TEST0001',
+            'country': 'US',
+        }]
+        row = {
+            'row_index': 10,
+            'ASIN': 'B0TEST0001',
+            '国家代码': 'US',
+            '状态': '投放中',
+            '广告系列总花费': '$12.34',
+            '投放链接': 'https://pboost.me/x?uid=abc1234',
+            '品牌ID': '1001',
+            '品牌名称': 'Brand',
+        }
+
+        updates, _ = app.calculate_updates(
+            feishu_data=[row],
+            asin_country_campaigns={('B0TEST0001', 'US'): campaigns},
+            asin_country_commission={},
+            row_campaigns={10: campaigns}
+        )
+
+        self.assertEqual(1, len(updates))
+        self.assertEqual(0.0, updates[0]['total_cost'])
+
+    def test_build_copy_offer_match_key_should_include_brand_id(self):
+        app = self.make_app()
+        col_indices = {'ASIN': 0, '国家代码': 1, '品牌ID': 2}
+
+        key = app.build_copy_offer_match_key(['B0TEST0001', 'us', '1001'], col_indices)
+
+        self.assertEqual(('B0TEST0001', 'US', '1001'), key)
+
+    def test_build_copy_offer_match_key_should_require_brand_id(self):
+        app = self.make_app()
+        col_indices = {'ASIN': 0, '国家代码': 1, '品牌ID': 2}
+
+        key = app.build_copy_offer_match_key(['B0TEST0001', 'US', ''], col_indices)
+
+        self.assertIsNone(key)
+
+    def test_copy_offer_has_non_key_data_should_ignore_brand_id(self):
+        app = self.make_app()
+        col_indices = {'品牌ID': 0, '品牌名称': 1, '佣金': 2}
+        copy_fields = ['品牌名称', '品牌ID', '佣金']
+
+        result = app.copy_offer_has_non_key_data(['1001', '', ''], col_indices, copy_fields)
+
+        self.assertFalse(result)
+
+    def test_copy_offer_has_non_key_data_should_detect_real_offer_fields(self):
+        app = self.make_app()
+        col_indices = {'品牌ID': 0, '品牌名称': 1, '佣金': 2}
+        copy_fields = ['品牌名称', '品牌ID', '佣金']
+
+        result = app.copy_offer_has_non_key_data(['1001', 'Anker', ''], col_indices, copy_fields)
+
+        self.assertTrue(result)
+
+    def test_format_brand_break_even_cpc_should_include_commission_and_clicks(self):
+        app = self.make_app()
+
+        result = app.format_brand_break_even_cpc(100, 50)
+
+        self.assertEqual('$2.00（$100.00/50）', result)
+
+    def test_format_brand_break_even_cpc_should_handle_zero_clicks(self):
+        app = self.make_app()
+
+        result = app.format_brand_break_even_cpc(100, 0)
+
+        self.assertEqual('$0.00（$100.00/0）', result)
+
+    def test_normalize_brand_key_should_strip_country_suffix_or_prefix(self):
+        app = self.make_app()
+
+        self.assertEqual('aosu', app.normalize_brand_key('Aosu CA'))
+        self.assertEqual('eureka', app.normalize_brand_key('Eureka France'))
+        self.assertEqual('anker', app.normalize_brand_key('DE-Anker'))
+        self.assertEqual('maono', app.normalize_brand_key('Maono_GB'))
+
+    def test_extract_country_from_campaign_name_should_normalize_gb_to_uk(self):
+        app = self.make_app()
+
+        result = app.extract_country_from_campaign_name('Maono_GB_6124_10248_20260429112122577')
+
+        self.assertEqual('UK', result)
+
+    def test_campaign_name_matches_brand_country_should_tolerate_brand_country_suffixes(self):
+        app = self.make_app()
+
+        self.assertTrue(app.campaign_name_matches_brand_country(
+            'Eureka_FR_6092_10228_20260428171255765',
+            'Eureka France',
+            'FR'
+        ))
+        self.assertTrue(app.campaign_name_matches_brand_country(
+            'Maono_GB_6124_10248_20260429112122577',
+            'Maono UK',
+            'UK'
+        ))
 
 
 if __name__ == '__main__':

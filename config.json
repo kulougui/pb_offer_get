@@ -1,11 +1,15 @@
 {
   "pb_token": "lrGBDS12Bt1nr5nH",
+  "yp_token": "5ec6e718749cd2b4",
+  "yp_site_id": "12008",
   "feishu_app_id": "cli_a8517363cf3bd013",
   "feishu_app_secret": "O4Sm3UNHjpykF9OZq3LroblsrCVYyQEp",
   "feishu_spreadsheet_token": "KnJ1wphpBiVMrGkWl5ncUkMGnfe",
   "feishu_sheet_id": "kPlW5z",
-  "google_developer_token": "1YsRjWGxV6XUdxtX8MiT3Q",
-  "google_mcc_id": "6885177935",
+  "google_developer_token": "EhYut0Pj6yQtXNPwxdkAbQ",
+  "google_mcc_id": "2160853519",
   "google_service_account_file": "credentials/google_ads_service_account.json",
+  "stats_start_date": "2026-04-01",
+  "stats_increment_days": "7",
   "save_path": "C:\\Users\\Administrator\\Desktop\\offers.xlsx"
 }

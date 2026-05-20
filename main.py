@@ -14,6 +14,7 @@ import threading
 import os
 import re
 import time
+from requests.exceptions import ReadTimeout, Timeout
 from google.ads.googleads.client import GoogleAdsClient
 from google.oauth2 import service_account
 
@@ -344,7 +345,7 @@ class OfferToolApp:
         info_frame.pack(fill=tk.X, pady=(0, 10))
         
         info_text = """• "开始统计"：获取Google Ads/PB数据，更新offer状态、广告系列数量、花费、佣金
-• "更新已有offer"：按品牌批量刷新已有offer信息
+• "更新 PB offer"：按品牌批量读取PB offer，更新已有PB offer信息并新增PB offer
 • "offer顺序整理"：对Offer表和广告系列表排序（按状态分组+总佣金降序）"""
         ttk.Label(info_frame, text=info_text, justify=tk.LEFT).pack(anchor=tk.W)
         
@@ -382,11 +383,14 @@ class OfferToolApp:
         self.stop_btn = ttk.Button(button_frame, text="停止", command=self.stop_statistics, state='disabled')
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 10))
         
-        self.update_offers_btn = ttk.Button(button_frame, text="更新已有offer", command=self.start_update_offers)
+        self.update_offers_btn = ttk.Button(button_frame, text="更新 PB offer", command=self.start_update_offers)
         self.update_offers_btn.pack(side=tk.LEFT, padx=(0, 10))
         
         self.sort_tables_btn = ttk.Button(button_frame, text="offer顺序整理", command=self.start_sort_tables)
         self.sort_tables_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.check_links_btn = ttk.Button(button_frame, text="检查链接健康", command=self.start_check_link_health)
+        self.check_links_btn.pack(side=tk.LEFT, padx=(0, 10))
         
         self.progress_label_manage = ttk.Label(button_frame, text="")
         self.progress_label_manage.pack(side=tk.RIGHT, padx=(10, 0))
@@ -641,23 +645,24 @@ class OfferToolApp:
         return ""
     
     def resolve_redirect_url(self, tracking_link):
-        """访问投放链接，从返回的HTML中提取JS重定向的最终URL
-        
-        pboost.me使用JavaScript location.replace()做客户端跳转，
-        而非HTTP 301/302重定向，因此需要解析HTML提取目标URL。
-        """
+        """访问投放链接并解析最终产品链接。"""
         if not tracking_link:
             return ""
         try:
-            resp = requests.get(tracking_link, timeout=15)
+            resp = requests.get(tracking_link, timeout=15, allow_redirects=True)
+            final_url = str(getattr(resp, 'url', '') or '').strip()
+            if final_url and final_url != tracking_link:
+                return final_url
+            refresh_header = str(resp.headers.get('refresh') or resp.headers.get('Refresh') or '').strip()
+            if refresh_header:
+                match = re.search(r'url\s*=\s*(.+)$', refresh_header, re.IGNORECASE)
+                if match:
+                    return match.group(1).strip().strip('"\'')
             if resp.status_code == 200:
                 html = resp.text
-                # 从 JavaScript location.replace(u) 中提取URL
-                # 格式: var u = "https://www.amazon.com/dp/...";
                 match = re.search(r'var\s+u\s*=\s*"([^"]+)";\s*\n\s*location\.replace', html)
                 if match:
                     return match.group(1)
-                # 备选：从 noscript meta refresh 中提取
                 match = re.search(r'<meta\s+http-equiv="refresh"\s+content="[^;]*;\s*url=([^"]+)"', html)
                 if match:
                     return match.group(1)
@@ -799,7 +804,7 @@ class OfferToolApp:
         self.update_progress_get("")
 
     def update_yp_links(self):
-        """为未带tag1的YP投放链接补充随机UID参数名"""
+        """回填YP投放链接对应的产品链接。"""
         if not self.feishu_app_id_var.get().strip() or not self.feishu_app_secret_var.get().strip():
             messagebox.showerror("错误", "请在API配置中输入飞书App ID和App Secret!")
             return
@@ -819,46 +824,75 @@ class OfferToolApp:
         link = str(link or '').strip()
         return ('https://yeahpromos.com/' in link) or ('https://www.yeahpromos.com/' in link)
 
-    def _yp_link_has_tag1(self, link):
-        link_lower = str(link or '').strip().lower()
-        return '{tag1}' in link_lower or '%7btag1%7d' in link_lower
+    def _is_pb_tracking_link(self, link):
+        """仅识别明确的PB投放链接，空链接和非PB链接都不算PB。"""
+        normalized_link = str(link or '').strip().lower()
+        if not normalized_link:
+            return False
+        return (
+            'https://pboost.me/' in normalized_link or
+            'http://pboost.me/' in normalized_link or
+            'https://www.pboost.me/' in normalized_link or
+            'http://www.pboost.me/' in normalized_link or
+            'https://partnerboost.com/' in normalized_link or
+            'http://partnerboost.com/' in normalized_link or
+            'https://www.partnerboost.com/' in normalized_link or
+            'http://www.partnerboost.com/' in normalized_link
+        )
 
-    def _append_yp_tag1_to_link(self, link, uid):
-        """将YP链接改为 ...&<uid>={tag1} 的格式，并替换已有的YP tag参数。"""
-        link = str(link or '').strip()
-        if not link:
-            return link
-        from urllib.parse import unquote
+    def build_copied_offer_tracking_link(self, asin, country, source_tracking_link):
+        """为复制offer决定投放链接。YP保留原链接，PB生成新UID链接。"""
+        normalized_source_link = str(source_tracking_link or '').strip()
+        if self._is_yp_tracking_link(normalized_source_link):
+            return normalized_source_link, False, ''
 
-        if '#' in link:
-            base, fragment = link.split('#', 1)
-            fragment = '#' + fragment
-        else:
-            base, fragment = link, ''
+        uid = self.generate_random_uid()
+        new_link = self.get_partnerboost_link(asin, country, uid)
+        return new_link, True, uid
 
-        if '?' in base:
-            prefix, query = base.split('?', 1)
-            raw_parts = [part for part in query.split('&') if part]
-        else:
-            prefix, raw_parts = base, []
+    def is_pb_offer_row(self, row, col_indices):
+        """判断飞书offer行是否属于PB且不是统计行。"""
+        status_idx = (col_indices or {}).get('状态')
+        if status_idx is not None and status_idx < len(row):
+            status = str(self.normalize_sheet_cell_value(row[status_idx]) or '').strip()
+            if status == SUMMARY_STATUS_TEXT:
+                return False
 
-        kept_parts = []
-        for part in raw_parts:
-            if '=' in part:
-                key, value = part.split('=', 1)
-            else:
-                key, value = part, ''
+        tracking_link_idx = (col_indices or {}).get('投放链接')
+        if tracking_link_idx is None:
+            return False
+        if tracking_link_idx >= len(row):
+            return False
+        tracking_link = str(self.normalize_sheet_cell_value(row[tracking_link_idx]) or '').strip()
+        return self._is_pb_tracking_link(tracking_link)
 
-            decoded_value = unquote(value).strip().lower()
-            # 替换已有的YP tag1占位参数，或清理历史错误生成的“7位uid=”空参数
-            if decoded_value == '{tag1}':
+    def build_copy_offer_match_key(self, row, col_indices):
+        """为复制offer功能构建源offer匹配键：ASIN + 国家代码 + 品牌ID。"""
+        asin_idx = (col_indices or {}).get('ASIN')
+        country_idx = (col_indices or {}).get('国家代码')
+        brand_id_idx = (col_indices or {}).get('品牌ID')
+
+        asin = str(row[asin_idx]).strip() if asin_idx is not None and asin_idx < len(row) and row[asin_idx] else ''
+        country = str(row[country_idx]).strip().upper() if country_idx is not None and country_idx < len(row) and row[country_idx] else ''
+        brand_id = str(row[brand_id_idx]).strip() if brand_id_idx is not None and brand_id_idx < len(row) and row[brand_id_idx] else ''
+
+        if not asin or not country or not brand_id:
+            return None
+        return asin, country, brand_id
+
+    def copy_offer_has_non_key_data(self, row, col_indices, copy_fields):
+        """判断复制offer行是否包含匹配键之外的有效数据。"""
+        identity_fields = {'品牌ID'}
+        for field in copy_fields or []:
+            if field in identity_fields:
                 continue
-            if re.fullmatch(r'[a-z0-9]{7}', key, re.IGNORECASE) and value == '':
-                continue
-            kept_parts.append(part)
-
-        kept_parts.append(f"{uid}={{tag1}}")
-        return f"{prefix}?{'&'.join(kept_parts)}{fragment}"
+            if field in col_indices:
+                field_col = col_indices[field]
+                if field_col < len(row) and row[field_col]:
+                    cell_value = str(row[field_col]).strip()
+                    if cell_value and cell_value.lower() not in ['none', '']:
+                        return True
+        return False
 
     def extract_tracking_uid_from_link(self, link):
         """从投放链接提取UID，兼容PB的uid参数和YP的 <uid>={tag1} 格式。"""
@@ -908,6 +942,51 @@ class OfferToolApp:
             index = index * 26 + (ord(ch.upper()) - ord('A') + 1)
         return index - 1
 
+    def extract_yp_offer_marker(self, tracking_link='', product_link=''):
+        """提取用于区分YP复制offer的稳定标识，优先使用产品链接中的aa_adgroupid。"""
+        normalized_product_link = str(self.normalize_sheet_cell_value(product_link) or '').strip()
+        if normalized_product_link:
+            adgroupid_match = re.search(r'[?&]aa_adgroupid=([^&]+)', normalized_product_link, re.IGNORECASE)
+            if adgroupid_match:
+                return f"adg:{adgroupid_match.group(1)}"
+
+        normalized_tracking_link = str(self.normalize_sheet_cell_value(tracking_link) or '').strip()
+        if not normalized_tracking_link:
+            return ''
+
+        uid = self.extract_tracking_uid_from_link(normalized_tracking_link)
+        if uid:
+            return f"uid:{uid}"
+
+        pid_match = re.search(r'[?&]pid=([^&]+)', normalized_tracking_link, re.IGNORECASE)
+        if pid_match:
+            return f"pid:{pid_match.group(1)}"
+
+        return ''
+
+    def get_yp_campaign_group_key(self, offer_key, offer_summary=None):
+        """广告系列表按同一个YP投放链接聚合；Offer表仍可用aa_adgroupid区分行。"""
+        if not offer_key:
+            return None
+        offer_summary = offer_summary or {}
+        tracking_link = str(self.normalize_sheet_cell_value(offer_summary.get('tracking_link', '')) or '').strip()
+        if tracking_link:
+            link_marker = self.extract_tracking_uid_from_link(tracking_link)
+            if not link_marker:
+                pid_match = re.search(r'[?&]pid=([^&]+)', tracking_link, re.IGNORECASE)
+                if pid_match:
+                    link_marker = f"pid:{pid_match.group(1)}"
+            if not link_marker:
+                link_marker = self.extract_yp_offer_marker(tracking_link, '')
+            group_marker = link_marker or (offer_key[3] if len(offer_key) > 3 else '')
+            return (
+                offer_key[0],
+                offer_key[1],
+                offer_key[2],
+                f"yp:{group_marker}"
+            )
+        return offer_key
+
     def build_offer_row_groups(self, feishu_data):
         """构建offer表中有效数据行的分组信息。"""
         asin_country_rows = {}
@@ -936,7 +1015,8 @@ class OfferToolApp:
                 asin_country_rows.setdefault((asin, country), []).append(row_index)
 
             if self._is_yp_tracking_link(tracking_link) and brand_id:
-                yp_asin_brand_rows.setdefault((asin, brand_id), []).append(row_index)
+                yp_marker = self.extract_yp_offer_marker(tracking_link, row.get('产品链接', ''))
+                yp_asin_brand_rows.setdefault((asin, brand_id, country, yp_marker), []).append(row_index)
 
         return {
             'asin_country_rows': asin_country_rows,
@@ -954,20 +1034,23 @@ class OfferToolApp:
             'tracking_link_to_offer_keys': {},
         }
 
-        def ensure_group(asin, brand_id, country, brand_name=''):
+        def ensure_group(asin, brand_id, country, yp_marker='', brand_name=''):
             asin = str(asin or '').strip()
             brand_id = str(brand_id or '').strip()
             country = self.normalize_country_code(country or '')
+            yp_marker = str(yp_marker or '').strip()
             brand_name = str(brand_name or '').strip()
             if not asin or not brand_id or not country:
                 return None
 
-            offer_key = (asin, brand_id, country)
+            offer_key = (asin, brand_id, country, yp_marker)
             group_summary = context['offer_group_summary_by_key'].setdefault(offer_key, {
                 'asin': asin,
                 'brand_id': brand_id,
                 'brand_name': brand_name,
                 'country': country,
+                'yp_marker': yp_marker,
+                'tracking_link': '',
                 'is_yp': True,
                 'commission': 0.0,
             })
@@ -980,6 +1063,9 @@ class OfferToolApp:
             if not normalized_link:
                 return
             context['tracking_link_to_offer_keys'].setdefault(normalized_link, set()).add(offer_key)
+            group_summary = context['offer_group_summary_by_key'].get(offer_key)
+            if group_summary is not None and not group_summary.get('tracking_link'):
+                group_summary['tracking_link'] = normalized_link
 
         def remember_campaign_names(campaign_names, offer_key):
             for campaign_name in campaign_names or []:
@@ -999,6 +1085,7 @@ class OfferToolApp:
                 row.get('ASIN', ''),
                 row.get('品牌ID', ''),
                 row.get('国家代码', ''),
+                self.extract_yp_offer_marker(tracking_link, row.get('产品链接', '')),
                 row.get('品牌名称', '')
             )
             if not group_result:
@@ -1019,6 +1106,7 @@ class OfferToolApp:
                 row_info.get('asin', ''),
                 row_info.get('brand_id', ''),
                 row_info.get('country', ''),
+                self.extract_yp_offer_marker(row_info.get('tracking_link', ''), row_info.get('product_link', '')),
                 row_info.get('brand_name', '')
             )
             if not group_result:
@@ -1049,6 +1137,10 @@ class OfferToolApp:
         campaign_id = str(campaign_info.get('campaign_id', '') or '').strip()
         asin = str(campaign_info.get('asin', '') or '').strip()
         country = self.normalize_country_code(campaign_info.get('country', '') or '')
+        campaign_marker = self.extract_yp_offer_marker(
+            tracking_link or campaign_info.get('tracking_link', ''),
+            campaign_info.get('product_link', '')
+        )
 
         candidate_keys = set()
         if campaign_name:
@@ -1073,12 +1165,22 @@ class OfferToolApp:
 
         if asin and country and candidate_keys:
             matched_keys = [key for key in candidate_keys if key[0] == asin and key[2] == country]
+            if campaign_marker:
+                marker_matched_keys = [key for key in matched_keys if (len(key) > 3 and key[3] == campaign_marker)]
+                if len(marker_matched_keys) == 1:
+                    offer_key = marker_matched_keys[0]
+                    return offer_key, summary_by_key.get(offer_key, {})
             if len(matched_keys) == 1:
                 offer_key = matched_keys[0]
                 return offer_key, summary_by_key.get(offer_key, {})
 
         if has_explicit_yp_signal and asin and country:
             matched_keys = [key for key in summary_by_key.keys() if key[0] == asin and key[2] == country]
+            if campaign_marker:
+                marker_matched_keys = [key for key in matched_keys if (len(key) > 3 and key[3] == campaign_marker)]
+                if len(marker_matched_keys) == 1:
+                    offer_key = marker_matched_keys[0]
+                    return offer_key, summary_by_key.get(offer_key, {})
             if len(matched_keys) == 1:
                 offer_key = matched_keys[0]
                 return offer_key, summary_by_key.get(offer_key, {})
@@ -1240,7 +1342,37 @@ class OfferToolApp:
         text = str(brand_name or '').strip()
         if not text:
             return ''
-        return re.sub(r'\s+', ' ', text).lower()
+        text = re.sub(r'\s+', ' ', text)
+
+        country_tokens = {
+            'us', 'uk', 'gb', 'de', 'fr', 'it', 'es', 'ca', 'jp', 'au', 'nl', 'be',
+            'mx', 'br', 'in', 'sg', 'ae', 'sa', 'pl', 'se', 'tr', 'eg',
+            'united states', 'united kingdom', 'great britain', 'germany', 'france',
+            'italy', 'spain', 'canada', 'japan', 'australia', 'netherlands', 'belgium',
+            'mexico', 'brazil', 'india', 'singapore', 'uae', 'saudi arabia', 'poland',
+            'sweden', 'turkey', 'egypt',
+        }
+
+        lower_text = text.lower()
+        changed = True
+        while changed and lower_text:
+            changed = False
+            for token in sorted(country_tokens, key=len, reverse=True):
+                escaped = re.escape(token)
+                patterns = [
+                    rf'^{escaped}[\s\-_]+',
+                    rf'[\s\-_]+{escaped}$',
+                ]
+                for pattern in patterns:
+                    candidate = re.sub(pattern, '', lower_text, count=1).strip(' _-')
+                    if candidate != lower_text:
+                        lower_text = candidate
+                        changed = True
+                        break
+                if changed:
+                    break
+
+        return re.sub(r'\s+', ' ', lower_text).strip()
 
     def build_break_even_brand_country_offer_index(self, feishu_data, offer_row_commissions=None):
         """基于offer表构建品牌+国家映射，供品牌级佣金与点击汇总复用。"""
@@ -1472,12 +1604,13 @@ class OfferToolApp:
         if not name or not brand or not normalized_country:
             return False
 
-        tokens = [token.strip().lower() for token in re.split(r'[-_]', name) if token.strip()]
-        brand_tokens = [token.strip().lower() for token in re.split(r'[-_\s]+', brand) if token.strip()]
-        country_upper = normalized_country.upper()
-
-        if country_upper not in {token.upper() for token in tokens}:
+        campaign_country = self.extract_country_from_campaign_name(name)
+        if campaign_country != normalized_country:
             return False
+
+        tokens = [token.strip().lower() for token in re.split(r'[-_]', name) if token.strip()]
+        normalized_brand = self.normalize_brand_key(brand)
+        brand_tokens = [token.strip().lower() for token in re.split(r'[-_\s]+', normalized_brand) if token.strip()]
         if not brand_tokens:
             return False
         return all(token in tokens for token in brand_tokens)
@@ -1563,6 +1696,13 @@ class OfferToolApp:
 
         return brand_country_clicks
 
+    def format_brand_break_even_cpc(self, total_commission, total_clicks):
+        """格式化品牌收支平衡CPC展示：$2.00（$100/50）。"""
+        commission = float(total_commission or 0.0)
+        clicks = int(total_clicks or 0)
+        break_even_cpc = (commission / clicks) if clicks > 0 else 0.0
+        return f"${break_even_cpc:.2f}（${commission:.2f}/{clicks}）"
+
     def apply_brand_break_even_cpc(self, updates, new_rows, mcc_campaigns, brand_country_totals):
         """把品牌收支平衡CPC写入广告系列更新结果。"""
         break_even_updates = 0
@@ -1585,8 +1725,7 @@ class OfferToolApp:
 
                 total_clicks = int(aggregate.get('clicks', 0) or 0)
                 total_commission = float(aggregate.get('commission', 0.0) or 0.0)
-                break_even_cpc = (total_commission / total_clicks) if total_clicks > 0 else 0.0
-                item['品牌收支平衡CPC'] = f"${break_even_cpc:.2f}"
+                item['品牌收支平衡CPC'] = self.format_brand_break_even_cpc(total_commission, total_clicks)
                 break_even_updates += 1
 
         apply_to_rows(updates or [])
@@ -1613,8 +1752,7 @@ class OfferToolApp:
 
             total_clicks = int(aggregate.get('clicks', 0) or 0)
             total_commission = float(aggregate.get('commission', 0.0) or 0.0)
-            break_even_cpc = (total_commission / total_clicks) if total_clicks > 0 else 0.0
-            item['品牌收支平衡CPC'] = f"${break_even_cpc:.2f}"
+            item['品牌收支平衡CPC'] = self.format_brand_break_even_cpc(total_commission, total_clicks)
             break_even_updates += 1
 
         return break_even_updates
@@ -1698,10 +1836,44 @@ class OfferToolApp:
             self.log_manage(f"    插入行异常: {e}")
             return False
 
+    def delete_sheet_rows(self, token, spreadsheet_token, sheet_id, row_indices):
+        """删除飞书工作表中的指定行，row_indices 为 1-based 行号。"""
+        rows = sorted({int(row) for row in row_indices if row and int(row) > 1}, reverse=True)
+        if not rows:
+            return True
+
+        url = f"{FEISHU_API_BASE_URL}/sheets/v2/spreadsheets/{spreadsheet_token}/dimension_range"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        for row_index in rows:
+            start_index = row_index - 1
+            body = {
+                "dimension": {
+                    "sheetId": sheet_id,
+                    "majorDimension": "ROWS",
+                    "startIndex": start_index,
+                    "endIndex": start_index + 1
+                }
+            }
+            try:
+                response = requests.delete(url, headers=headers, json=body, timeout=30)
+                result = response.json()
+                if result.get('code') != 0:
+                    self.log_manage(f"    删除行失败 row={row_index}: code={result.get('code')}, {result.get('msg', '')}")
+                    return False
+            except Exception as e:
+                self.log_manage(f"    删除行异常 row={row_index}: {e}")
+                return False
+
+        return True
+
     def _do_update_yp_links(self):
         try:
             self.log_get("=" * 50)
-            self.log_get("开始更新YP链接...")
+            self.log_get("开始回填YP产品链接...")
             self.log_get("=" * 50)
 
             token = self.get_feishu_token()
@@ -1718,58 +1890,75 @@ class OfferToolApp:
             self.update_progress_get("读取飞书数据...")
             feishu_data = self.get_feishu_sheet_data(token)
             tracking_link_col = self.feishu_column_map.get('投放链接')
-            if tracking_link_col is None:
-                self.log_get("未找到“投放链接”列")
+            product_link_col = self.feishu_column_map.get('产品链接')
+            if tracking_link_col is None or product_link_col is None:
+                self.log_get("未找到“投放链接”列或“产品链接”列")
                 return
 
-            tracking_link_col_idx = ord(tracking_link_col) - ord('A')
+            product_link_col_idx = ord(product_link_col) - ord('A')
             yp_rows = []
-            already_tagged = 0
             empty_link_count = 0
+            existing_product_link_count = 0
 
             for row in feishu_data:
-                link = str(row.get('投放链接', '') or '').strip()
+                link = str(self.normalize_sheet_cell_value(row.get('投放链接', '')) or '').strip()
                 if not link:
                     empty_link_count += 1
                     continue
                 if not self._is_yp_tracking_link(link):
                     continue
-                if self._yp_link_has_tag1(link):
-                    already_tagged += 1
+
+                product_link = str(self.normalize_sheet_cell_value(row.get('产品链接', '')) or '').strip()
+                if product_link:
+                    existing_product_link_count += 1
                     continue
-                yp_rows.append((row.get('row_index'), link))
+
+                row_index = row.get('row_index')
+                if not row_index:
+                    continue
+                yp_rows.append((row_index, link))
 
             self.log_get(f"  扫描到 {len(feishu_data)} 行Offer")
-            self.log_get(f"  YP链接待更新: {len(yp_rows)} 行")
-            self.log_get(f"  已包含tag1的YP链接: {already_tagged} 行")
+            self.log_get(f"  符合条件的YP行: {len(yp_rows)} 行")
+            self.log_get(f"  已有产品链接的YP行: {existing_product_link_count} 行")
             if empty_link_count:
                 self.log_get(f"  空投放链接: {empty_link_count} 行")
 
             if not yp_rows:
-                self.log_get("没有需要更新的YP链接")
+                self.log_get("没有需要回填产品链接的YP行")
                 return
 
-            self.log_get("\n【步骤2】生成UID并拼接tag1模板...")
-            self.update_progress_get("生成YP链接...")
+            self.log_get("\n【步骤2】访问YP投放链接并解析产品链接...")
+            self.update_progress_get("解析产品链接...")
             updates = []
+            failed_rows = []
             for idx, (row_idx, link) in enumerate(yp_rows, start=1):
-                uid = self.generate_random_uid()
-                new_link = self._append_yp_tag1_to_link(link, uid)
-                updates.append((row_idx, tracking_link_col_idx, new_link))
-                self.log_get(f"  第{row_idx}行: uid={uid}")
-                self.root.after(0, lambda i=idx, t=len(yp_rows): self.update_progress_get(f"生成链接 {i}/{t}"))
+                self.root.after(0, lambda i=idx, t=len(yp_rows): self.update_progress_get(f"解析链接 {i}/{t}"))
+                product_link = self.resolve_redirect_url(link)
+                if product_link:
+                    updates.append((row_idx, product_link_col_idx, product_link))
+                    self.log_get(f"  第{row_idx}行: 已获取产品链接")
+                else:
+                    failed_rows.append(row_idx)
+                    self.log_get(f"  第{row_idx}行: 未获取到产品链接")
+                time.sleep(0.1)
 
-            self.log_get("\n【步骤3】写回飞书表格...")
+            if not updates:
+                self.log_get("未解析到任何可写回的产品链接")
+                return
+
+            self.log_get("\n【步骤3】写回产品链接到飞书表格...")
             self.update_progress_get("写入飞书...")
-            self._batch_update_sheet_cells(token, spreadsheet_token, updates)
+            success = self._batch_update_sheet_cells(token, spreadsheet_token, updates)
 
             self.log_get("\n" + "=" * 50)
             self.log_get("更新完成！统计信息：")
-            self.log_get(f"  成功更新: {len(updates)} 行")
-            self.log_get(f"  已跳过(已有tag1): {already_tagged} 行")
+            self.log_get(f"  成功写回产品链接: {len(updates)} 行")
+            self.log_get(f"  解析失败: {len(failed_rows)} 行")
+            self.log_get(f"  飞书写入结果: {'成功' if success else '部分失败'}")
             self.log_get("=" * 50)
         except Exception as e:
-            self.log_get(f"更新YP链接时发生错误: {str(e)}")
+            self.log_get(f"回填YP产品链接时发生错误: {str(e)}")
             import traceback
             self.log_get(traceback.format_exc())
         finally:
@@ -1845,12 +2034,13 @@ class OfferToolApp:
             self.log_get(f"  检测到的列: {list(col_indices.keys())}")
             
             # 必需的列
-            if 'ASIN' not in col_indices or '国家代码' not in col_indices:
-                self.log_get("未找到ASIN或国家代码列")
+            if 'ASIN' not in col_indices or '国家代码' not in col_indices or '品牌ID' not in col_indices:
+                self.log_get("未找到ASIN、国家代码或品牌ID列")
                 return
             
             asin_col = col_indices['ASIN']
             country_col = col_indices['国家代码']
+            brand_id_col = col_indices['品牌ID']
             tracking_link_col = col_indices.get('投放链接')
             product_link_col = col_indices.get('产品链接')
             
@@ -1863,26 +2053,17 @@ class OfferToolApp:
             # 第一遍扫描：识别复制源和复制对象
             self.log_get("\n【步骤2】识别复制源和复制对象...")
             
-            copy_sources = []  # [(row_idx, asin, country), ...]
-            complete_offers = {}  # {(asin, country): (row_idx, row_data), ...} 第一个完整offer
+            copy_sources = []  # [(row_idx, asin, country, brand_id), ...]
+            complete_offers = {}  # {(asin, country, brand_id): (row_idx, row_data), ...} 第一个完整offer
             
             for row_idx, row in enumerate(values[1:], start=2):
-                asin = str(row[asin_col]).strip() if asin_col < len(row) and row[asin_col] else ''
-                country = str(row[country_col]).strip().upper() if country_col < len(row) and row[country_col] else ''
-                
-                if not asin or not country:
+                key = self.build_copy_offer_match_key(row, col_indices)
+                if not key:
                     continue
+                asin, country, brand_id = key
                 
-                # 检查是否只有ASIN和国家代码有值（复制源）
-                has_other_data = False
-                for field in copy_fields:
-                    if field in col_indices:
-                        field_col = col_indices[field]
-                        if field_col < len(row) and row[field_col]:
-                            cell_value = str(row[field_col]).strip()
-                            if cell_value and cell_value.lower() not in ['none', '']:
-                                has_other_data = True
-                                break
+                # 检查是否只有ASIN、国家代码和品牌ID有值（复制源）
+                has_other_data = self.copy_offer_has_non_key_data(row, col_indices, copy_fields)
                 
                 # 检查投放链接
                 has_tracking_link = False
@@ -1893,17 +2074,15 @@ class OfferToolApp:
                     if str(link_value).strip():
                         has_tracking_link = True
                 
-                key = (asin, country)
-                
                 if not has_other_data and not has_tracking_link:
-                    # 这是复制源（只有ASIN和国家代码）
-                    copy_sources.append((row_idx, asin, country))
+                    # 这是复制源（只有ASIN、国家代码和品牌ID）
+                    copy_sources.append((row_idx, asin, country, brand_id))
                 elif has_other_data:
                     # 这是有完整信息的offer，记录第一个作为复制对象
                     if key not in complete_offers:
                         complete_offers[key] = (row_idx, row)
             
-            self.log_get(f"  找到 {len(copy_sources)} 个复制源（只有ASIN和国家代码）")
+            self.log_get(f"  找到 {len(copy_sources)} 个复制源（只有ASIN、国家代码和品牌ID）")
             self.log_get(f"  找到 {len(complete_offers)} 个有完整信息的offer")
             
             if not copy_sources:
@@ -1919,16 +2098,16 @@ class OfferToolApp:
             success_count = 0
             skip_count = 0
             
-            for row_idx, asin, country in copy_sources:
-                key = (asin, country)
+            for row_idx, asin, country, brand_id in copy_sources:
+                key = (asin, country, brand_id)
                 
                 if key not in complete_offers:
-                    self.log_get(f"  [跳过] {asin}_{country}: 未找到同ASIN+国家的完整offer")
+                    self.log_get(f"  [跳过] {asin}_{country}_{brand_id}: 未找到同ASIN+国家+品牌ID的完整offer")
                     skip_count += 1
                     continue
                 
                 source_row_idx, source_row = complete_offers[key]
-                self.log_get(f"  [复制] {asin}_{country}: 从第{source_row_idx}行复制到第{row_idx}行")
+                self.log_get(f"  [复制] {asin}_{country}_{brand_id}: 从第{source_row_idx}行复制到第{row_idx}行")
                 
                 # 复制字段（除投放链接外）
                 for field in copy_fields:
@@ -1956,10 +2135,6 @@ class OfferToolApp:
                     style_updates.append((row_idx, status_col, 'blue_bold'))
                     self.log_get(f"    设置状态: 新复制 (蓝色加粗)")
                 
-                # 生成新的投放链接
-                self.log_get(f"    获取新投放链接...")
-                uid = self.generate_random_uid()  # 为复制的offer生成随机uid
-
                 source_tracking_link = ''
                 if tracking_link_col is not None and tracking_link_col < len(source_row) and source_row[tracking_link_col]:
                     source_tracking_link = source_row[tracking_link_col]
@@ -1967,16 +2142,18 @@ class OfferToolApp:
                         source_tracking_link = source_tracking_link[0].get('link', '') or source_tracking_link[0].get('text', '')
                     source_tracking_link = str(source_tracking_link).strip()
 
-                new_link = ''
-                if self._is_yp_tracking_link(source_tracking_link):
-                    new_link = self._append_yp_tag1_to_link(source_tracking_link, uid)
-                    self.log_get(f"    识别为YP链接，已生成新链接 (uid={uid})")
+                new_link, generated_new_link, uid = self.build_copied_offer_tracking_link(asin, country, source_tracking_link)
+                if not generated_new_link and self._is_yp_tracking_link(source_tracking_link):
+                    self.log_get("    识别为YP链接，保留原投放链接")
                 else:
-                    new_link = self.get_partnerboost_link(asin, country, uid)
+                    self.log_get(f"    获取新投放链接...")
 
                 if new_link and tracking_link_col is not None:
                     updates.append((row_idx, tracking_link_col, new_link))
-                    self.log_get(f"    新投放链接: {new_link[-40:]} (uid={uid})")
+                    if not generated_new_link and self._is_yp_tracking_link(new_link):
+                        self.log_get(f"    投放链接已保留: {new_link[-40:]}")
+                    else:
+                        self.log_get(f"    新投放链接: {new_link[-40:]} (uid={uid})")
 
                     # 仅PB链接需要解析重定向并更新产品链接；YP链接保留复制来的产品链接
                     if product_link_col is not None and not self._is_yp_tracking_link(new_link):
@@ -2896,6 +3073,7 @@ class OfferToolApp:
         self.stop_btn.config(state='normal')
         self.update_offers_btn.config(state='disabled')
         self.sort_tables_btn.config(state='disabled')
+        self.check_links_btn.config(state='disabled')
         self.progress_manage.start()
         self.log_text_manage.delete(1.0, tk.END)
         
@@ -2913,6 +3091,7 @@ class OfferToolApp:
         self.stop_btn.config(state='disabled')
         self.update_offers_btn.config(state='normal')
         self.sort_tables_btn.config(state='normal')
+        self.check_links_btn.config(state='normal')
         self.progress_manage.stop()
         self.update_progress_manage("")
     
@@ -2923,6 +3102,7 @@ class OfferToolApp:
         self.stop_btn.config(state='normal')
         self.update_offers_btn.config(state='disabled')
         self.sort_tables_btn.config(state='disabled')
+        self.check_links_btn.config(state='disabled')
         self.progress_manage.start()
         self.log_text_manage.delete(1.0, tk.END)
         
@@ -2977,14 +3157,203 @@ class OfferToolApp:
             self.log_manage(traceback.format_exc())
         finally:
             self.root.after(0, self._restore_manage_ui)
-    
-    def start_update_offers(self):
-        """开始更新已有offer"""
+
+    def start_check_link_health(self):
+        """开始检查投放链接解析出的产品链接是否与表格记录一致。"""
         self.stop_flag = False
         self.start_stats_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
         self.update_offers_btn.config(state='disabled')
         self.sort_tables_btn.config(state='disabled')
+        self.check_links_btn.config(state='disabled')
+        self.progress_manage.start()
+        self.log_text_manage.delete(1.0, tk.END)
+
+        thread = threading.Thread(target=self._do_check_link_health)
+        thread.daemon = True
+        thread.start()
+
+    def normalize_url_for_compare(self, value):
+        """标准化URL用于健康检查对比，保留查询参数语义。"""
+        url = str(self.normalize_sheet_cell_value(value) or '').strip()
+        if not url:
+            return ''
+        return url.rstrip('/')
+
+    def is_ended_status(self, status):
+        return str(status or '').strip().startswith('投放已结束')
+
+    def is_link_health_target_status(self, status):
+        """链接健康检查只采集投放中和暂停中的行。"""
+        status_text = str(status or '').strip()
+        return (
+            status_text.startswith('投放中') or
+            status_text.startswith('暂停中') or
+            status_text.startswith('暂停') or
+            status_text.startswith('广告系列暂停中')
+        )
+
+    def _add_link_health_item(self, grouped_items, tracking_link, product_link, source, row_index, label):
+        tracking_link = self.normalize_url_for_compare(tracking_link)
+        product_link = self.normalize_url_for_compare(product_link)
+        if not tracking_link:
+            return False
+
+        key = (tracking_link, product_link)
+        item = grouped_items.setdefault(key, {
+            'tracking_link': tracking_link,
+            'old_product_link': product_link,
+            'sources': []
+        })
+        item['sources'].append({
+            'source': source,
+            'row_index': row_index,
+            'label': label,
+            'old_product_link': product_link
+        })
+        return True
+
+    def collect_link_health_items(self, token, spreadsheet_token):
+        """从Offer表和广告系列表采集非投放已结束行的投放链接/产品链接组。"""
+        grouped_items = {}
+
+        offer_rows = self.get_feishu_sheet_data(token)
+        offer_count = 0
+        for row in offer_rows or []:
+            status = str(row.get('状态', '') or '').strip()
+            if not self.is_link_health_target_status(status) or status == SUMMARY_STATUS_TEXT:
+                continue
+            tracking_link = row.get('投放链接', '')
+            product_link = row.get('产品链接', '')
+            asin = str(row.get('ASIN', '') or '').strip()
+            brand = str(row.get('品牌名称', '') or '').strip()
+            country = self.normalize_country_code(row.get('国家代码', '') or '')
+            label_parts = [part for part in [f"ASIN={asin}" if asin else '', f"品牌={brand}" if brand else '', f"国家={country}" if country else ''] if part]
+            label = ', '.join(label_parts) if label_parts else '未命名Offer'
+            if self._add_link_health_item(grouped_items, tracking_link, product_link, 'Offer表', row.get('row_index'), label):
+                offer_count += 1
+
+        campaigns_sheet_id = "XrkOF7"
+        campaigns_data = self.read_campaigns_sheet(token, spreadsheet_token, campaigns_sheet_id)
+        campaign_count = 0
+        if campaigns_data:
+            campaign_rows, _, _ = campaigns_data
+            for row in campaign_rows or []:
+                status = str(row.get('状态', '') or '').strip()
+                if not self.is_link_health_target_status(status) or status == SUMMARY_STATUS_TEXT:
+                    continue
+                campaign_name = str(row.get('广告系列名称', '') or '').strip()
+                label = campaign_name or '未命名广告系列'
+                if self._add_link_health_item(grouped_items, row.get('投放链接', ''), row.get('产品链接', ''), '广告系列表', row.get('row_index'), label):
+                    campaign_count += 1
+
+        sources_by_tracking_link = {}
+        for item in grouped_items.values():
+            tracking_link = item.get('tracking_link', '')
+            if not tracking_link:
+                continue
+            sources_by_tracking_link.setdefault(tracking_link, [])
+            sources_by_tracking_link[tracking_link].extend(item.get('sources', []))
+
+        for item in grouped_items.values():
+            item['all_tracking_sources'] = sources_by_tracking_link.get(item.get('tracking_link', ''), [])
+
+        return list(grouped_items.values()), offer_count, campaign_count
+
+    def _do_check_link_health(self):
+        """检查投放链接当前解析出的产品链接是否与表格旧产品链接一致。"""
+        try:
+            self.log_manage("=" * 50)
+            self.log_manage("开始检查链接健康...")
+            self.log_manage("=" * 50)
+
+            token = self.get_feishu_token()
+            if not token:
+                self.log_manage("获取飞书访问令牌失败")
+                return
+
+            spreadsheet_token = self.feishu_spreadsheet_var.get().strip()
+            if not spreadsheet_token:
+                self.log_manage("飞书电子表格配置缺失")
+                return
+
+            self.log_manage("\n【步骤1】采集Offer表和广告系列表链接...")
+            self.update_progress_manage("采集链接...")
+            items, offer_count, campaign_count = self.collect_link_health_items(token, spreadsheet_token)
+            self.log_manage(f"  Offer表采集链接组: {offer_count} 组")
+            self.log_manage(f"  广告系列表采集链接组: {campaign_count} 组")
+            self.log_manage(f"  去重后待检查链接组: {len(items)} 组")
+
+            if not items:
+                self.log_manage("没有需要检查的链接")
+                return
+
+            self.log_manage("\n【步骤2】解析投放链接并对比产品链接...")
+            self.update_progress_manage("检查链接...")
+            mismatch_count = 0
+            failed_count = 0
+            checked_count = 0
+
+            for idx, item in enumerate(items, start=1):
+                if self.stop_flag:
+                    self.log_manage("已停止")
+                    return
+                tracking_link = item.get('tracking_link', '')
+                old_product_link = item.get('old_product_link', '')
+                self.update_progress_manage(f"检查链接 {idx}/{len(items)}")
+                new_product_link = self.normalize_url_for_compare(self.resolve_redirect_url(tracking_link))
+                checked_count += 1
+
+                if not new_product_link:
+                    failed_count += 1
+                    self.log_manage(f"  [解析失败] 投放链接: {tracking_link}")
+                    continue
+
+                if self.normalize_url_for_compare(old_product_link) == new_product_link:
+                    continue
+
+                mismatch_count += 1
+                self.log_manage("\n  [产品链接不一致]")
+                self.log_manage(f"    投放链接: {tracking_link}")
+                self.log_manage(f"    表格旧产品链接: {old_product_link or '(空)'}")
+                self.log_manage(f"    当前解析产品链接: {new_product_link}")
+                self.log_manage("    本组关联位置:")
+                for source in item.get('sources', []):
+                    self.log_manage(
+                        f"      - {source.get('source')} 第{source.get('row_index')}行: {source.get('label')}"
+                    )
+                all_sources = item.get('all_tracking_sources', [])
+                if len(all_sources) > len(item.get('sources', [])):
+                    self.log_manage("    该投放链接的全部关联位置:")
+                    for source in all_sources:
+                        source_old_link = source.get('old_product_link') or '(空)'
+                        self.log_manage(
+                            f"      - {source.get('source')} 第{source.get('row_index')}行: {source.get('label')} | 旧产品链接={source_old_link}"
+                        )
+                self.log_manage("    提醒: 请检查并更新该投放链接对应的产品链接")
+                time.sleep(0.1)
+
+            self.log_manage("\n" + "=" * 50)
+            self.log_manage("链接健康检查完成！统计信息：")
+            self.log_manage(f"  已检查: {checked_count} 组")
+            self.log_manage(f"  产品链接不一致: {mismatch_count} 组")
+            self.log_manage(f"  解析失败: {failed_count} 组")
+            self.log_manage("=" * 50)
+        except Exception as e:
+            self.log_manage(f"检查链接健康时发生错误: {str(e)}")
+            import traceback
+            self.log_manage(traceback.format_exc())
+        finally:
+            self.root.after(0, self._restore_manage_ui)
+    
+    def start_update_offers(self):
+        """开始更新PB offer"""
+        self.stop_flag = False
+        self.start_stats_btn.config(state='disabled')
+        self.stop_btn.config(state='normal')
+        self.update_offers_btn.config(state='disabled')
+        self.sort_tables_btn.config(state='disabled')
+        self.check_links_btn.config(state='disabled')
         self.progress_manage.start()
         
         thread = threading.Thread(target=self._do_update_offers)
@@ -2992,10 +3361,10 @@ class OfferToolApp:
         thread.start()
     
     def _do_update_offers(self):
-        """执行更新已有offer操作（按品牌批量获取）"""
+        """执行更新PB offer操作（按品牌批量获取，仅处理PB行）"""
         try:
             self.log_manage("=" * 50)
-            self.log_manage("开始更新已有offer（按品牌批量获取）...")
+            self.log_manage("开始更新PB offer（按品牌批量获取，仅处理PB行）...")
             self.log_manage("=" * 50)
             
             # 获取飞书访问令牌
@@ -3033,7 +3402,7 @@ class OfferToolApp:
             
             # 找到关键列的索引
             col_indices = {}
-            target_cols = ['ASIN', '国家代码', '品牌名称', '品牌ID', '佣金', '库存状态', '更新时间', 
+            target_cols = ['状态', 'ASIN', '国家代码', '品牌名称', '品牌ID', '佣金', '库存状态', '更新时间', 
                           '投放链接', '折扣价', '产品名称', '产品链接', '原价', '货币', '评论数', 'Reviews']
             for i, h in enumerate(headers_row):
                 h_str = str(h).strip() if h else ''
@@ -3050,17 +3419,17 @@ class OfferToolApp:
             # 获取表格实际的列数（用于验证）
             max_col_idx = len(headers_row) - 1
             
-            # 收集飞书现有offer和品牌ID
-            # 修改：支持同一个(asin, country)有多行（复制的offer）
-            existing_offers = {}  # (asin, country) -> [(row_idx, offer_data), ...]  改为列表
+            # 收集飞书现有PB offer和品牌ID
+            # 支持同一个(asin, country)有多行（复制的offer）
+            existing_offers = {}  # (asin, country) -> [(row_idx, row, brand_id), ...]
             existing_asins = {}   # asin -> (row_idx, country)  用于ASIN回退匹配
             brand_ids = set()
+            skipped_non_pb_rows = 0
             
             for row_idx, row in enumerate(values[1:], start=2):
                 asin_idx = col_indices.get('ASIN')
                 country_idx = col_indices.get('国家代码')
                 brand_id_idx = col_indices.get('品牌ID')
-                
                 asin = str(row[asin_idx]).strip() if asin_idx is not None and asin_idx < len(row) else ''
                 country = str(row[country_idx]).strip().upper() if country_idx is not None and country_idx < len(row) else ''
                 brand_id = str(row[brand_id_idx]).strip() if brand_id_idx is not None and brand_id_idx < len(row) else ''
@@ -3068,11 +3437,14 @@ class OfferToolApp:
                 # 跳过"总计"行或空ASIN行
                 if not asin or asin.lower() in ['none', '总计', 'total']:
                     continue
+                if not self.is_pb_offer_row(row, col_indices):
+                    skipped_non_pb_rows += 1
+                    continue
                 
                 key = (asin, country)
                 if key not in existing_offers:
                     existing_offers[key] = []
-                existing_offers[key].append((row_idx, row))
+                existing_offers[key].append((row_idx, row, brand_id))
                 existing_asins[asin] = (row_idx, country)
                 # 只添加有效的brand_id（过滤掉空值和None）
                 if brand_id and brand_id.lower() not in ['none', '']:
@@ -3080,7 +3452,8 @@ class OfferToolApp:
             
             # 统计唯一的(asin, country)组合数和总行数
             total_rows = sum(len(rows) for rows in existing_offers.values())
-            self.log_manage(f"  飞书现有offer: {total_rows} 行（{len(existing_offers)} 个唯一组合）")
+            self.log_manage(f"  飞书现有PB offer: {total_rows} 行（{len(existing_offers)} 个唯一组合）")
+            self.log_manage(f"  跳过非PB行（统计行/YP行/空链接行）: {skipped_non_pb_rows} 行")
             self.log_manage(f"  涉及品牌ID: {len(brand_ids)} 个")
             
             if self.stop_flag:
@@ -3092,6 +3465,8 @@ class OfferToolApp:
             self.update_progress_manage("获取PB数据...")
             
             all_pb_offers = {}  # (asin, country) -> offer_data
+            failed_brand_requests = {}
+            successful_brand_ids = set()
             
             for i, brand_id in enumerate(brand_ids):
                 if self.stop_flag:
@@ -3099,7 +3474,12 @@ class OfferToolApp:
                     return
                 
                 self.log_manage(f"  获取品牌 {brand_id} 的offer... ({i+1}/{len(brand_ids)})")
-                offers = self.get_offers_by_brand(brand_id)
+                result = self.get_offers_by_brand(brand_id)
+                offers = result.get('offers', [])
+                if result.get('success'):
+                    successful_brand_ids.add(str(brand_id).strip())
+                else:
+                    failed_brand_requests[str(brand_id).strip()] = result.get('error', '未知错误')
                 self.log_manage(f"    品牌 {brand_id}: PB返回 {len(offers)} 个offer")
                 
                 for offer in offers:
@@ -3146,13 +3526,17 @@ class OfferToolApp:
                 time.sleep(0.2)  # 品牌间间隔
             
             self.log_manage(f"  PB总共返回 {len(all_pb_offers)} 个有效offer")
+            if failed_brand_requests:
+                self.log_manage(f"  PB请求失败品牌: {len(failed_brand_requests)} 个")
+                for failed_brand_id, failed_reason in failed_brand_requests.items():
+                    self.log_manage(f"    失败品牌 {failed_brand_id}: {failed_reason}")
             
             if self.stop_flag:
                 self.log_manage("已停止")
                 return
             
-            # 对比并更新
-            self.log_manage("\n【步骤3】对比并更新offer...")
+            # 对比并更新PB offer
+            self.log_manage("\n【步骤3】对比并更新PB offer...")
             self.update_progress_manage("对比更新...")
             
             updates = []  # (row_idx, col_idx, new_value)
@@ -3167,12 +3551,19 @@ class OfferToolApp:
                 pb_offer = all_pb_offers.get((asin, country))
                 
                 # 对该(asin, country)的所有行进行相同的更新
-                for row_idx, row in rows_list:
+                for row_idx, row, row_brand_id in rows_list:
                     # 调试前几行
                     if row_idx <= 5:
                         self.log_manage(f"    调试: 第{row_idx}行 ASIN={asin} 国家={country} PB匹配={'是' if pb_offer else '否'} 行数据长度={len(row)}")
                     
                     if not pb_offer:
+                        normalized_row_brand_id = str(row_brand_id or '').strip()
+                        if normalized_row_brand_id and normalized_row_brand_id not in successful_brand_ids:
+                            self.log_manage(
+                                f"  [跳过下架] {asin}_{country} (行{row_idx}): 品牌 {normalized_row_brand_id} 本次请求失败，禁止标记OUT_OF_STOCK"
+                            )
+                            unchanged_count += 1
+                            continue
                         # PB未返回此offer，可能已下架，标记为OUT_OF_STOCK
                         current_stock = str(row[col_indices.get('库存状态', -1)]).strip() if col_indices.get('库存状态', -1) < len(row) else ''
                         if current_stock != 'OUT_OF_STOCK':
@@ -3182,47 +3573,36 @@ class OfferToolApp:
                                 style_updates.append((row_idx, stock_col, 'red_bold'))
                                 self.log_manage(f"  [下架] {asin}_{country} (行{row_idx}): PB未返回，标记为OUT_OF_STOCK")
                                 updated_count += 1
+                        else:
+                            unchanged_count += 1
                         continue
                     
-                    # 对比字段
                     changes = []
-                    
-                    # 佣金对比
+
                     commission_col = col_indices.get('佣金')
                     if commission_col is not None:
-                        # 安全获取旧佣金值
-                        if commission_col < len(row):
-                            old_commission = str(row[commission_col]).strip()
-                        else:
-                            old_commission = ''
-                            # 调试：行数据不够长
-                            if row_idx <= 5:  # 只打印前几行的调试信息
-                                self.log_manage(f"    调试: 第{row_idx}行数据长度{len(row)}，佣金列索引{commission_col}超出范围")
+                        old_commission = str(row[commission_col]).strip() if commission_col < len(row) else ''
                         new_commission = str(pb_offer.get('commission', '')).strip()
-                        
-                        # 标准化佣金比较
+
                         old_val = self.normalize_commission(old_commission)
                         new_val = self.normalize_commission(new_commission)
-                        
+
                         if abs(old_val - new_val) > 0.0001:
                             updates.append((row_idx, commission_col, new_commission))
                             changes.append(f"佣金: {old_commission} → {new_commission}")
                             if new_val < old_val:
                                 style_updates.append((row_idx, commission_col, 'red_bold'))
 
-                    # 评论数对比
                     reviews_col = col_indices.get('评论数')
                     if reviews_col is None:
                         reviews_col = col_indices.get('Reviews')
                     if reviews_col is not None:
                         old_reviews = str(row[reviews_col]).strip() if reviews_col < len(row) and row[reviews_col] is not None else ''
                         new_reviews = str(pb_offer.get('reviews', '')).strip()
-
                         if old_reviews != new_reviews and new_reviews:
                             updates.append((row_idx, reviews_col, new_reviews))
                             changes.append(f"评论数: {old_reviews} → {new_reviews}")
-                    
-                    # 库存状态对比
+
                     stock_col = col_indices.get('库存状态')
                     if stock_col is not None:
                         old_stock = str(row[stock_col]).strip() if stock_col < len(row) else ''
@@ -3235,16 +3615,15 @@ class OfferToolApp:
                                 style_updates.append((row_idx, stock_col, 'red_bold'))
                             elif old_stock == 'OUT_OF_STOCK' and new_stock == 'IN_STOCK':
                                 style_updates.append((row_idx, stock_col, 'black_normal'))
-                    
-                    # 更新时间对比
+
                     update_time_col = col_indices.get('更新时间')
                     if update_time_col is not None:
                         old_time = str(row[update_time_col]).strip() if update_time_col < len(row) else ''
-                        new_time = str(pb_offer.get('update_time', '')).strip()  # PB返回的是update_time
-                        
+                        new_time = str(pb_offer.get('update_time', '')).strip()
                         if old_time != new_time and new_time:
                             updates.append((row_idx, update_time_col, new_time))
-                    
+                            changes.append(f"更新时间: {old_time} → {new_time}")
+
                     if changes:
                         brand_name = pb_offer.get('brand_name', '')
                         pb_country_info = pb_offer.get('_original_pb_country', '')
@@ -3256,12 +3635,10 @@ class OfferToolApp:
                         updated_count += 1
                     else:
                         unchanged_count += 1
-            
-            # 检查新offer
+
+            # 检查新PB offer
             for (asin, country), pb_offer in all_pb_offers.items():
-                # 检查是否是真正的新offer（ASIN在飞书中完全不存在）
                 if asin not in existing_asins:
-                    # 过滤掉佣金过低的offer
                     commission_val = self.normalize_commission(pb_offer.get('commission', '0'))
                     if commission_val <= 0.0001:
                         continue
@@ -3276,84 +3653,114 @@ class OfferToolApp:
                 self.log_manage(f"\n【步骤4】应用更新到飞书... ({len(updates)} 个单元格)")
                 self.update_progress_manage("写入飞书...")
                 self._apply_offer_updates(token, updates, style_updates)
-            
-            # 添加新offer
+
             if new_offers:
-                self.log_manage(f"\n【步骤5】添加新offer到飞书... ({len(new_offers)} 个)")
+                self.log_manage(f"\n【步骤5】添加新PB offer到飞书... ({len(new_offers)} 个)")
                 self.update_progress_manage("添加新offer...")
                 self._append_new_offers(token, new_offers, col_indices)
+
+            self.log_manage("\n【步骤6】按品牌整理PB offer顺序...")
+            self.update_progress_manage("整理PB offer顺序...")
+            self.sort_pb_offer_rows_by_brand(token)
             
             # 输出统计
             self.log_manage("\n" + "=" * 50)
-            self.log_manage("更新完成！统计信息：")
+            self.log_manage("PB offer更新完成！统计信息：")
             self.log_manage(f"  已更新offer: {updated_count} 个")
             self.log_manage(f"  无变化offer: {unchanged_count} 个")
             self.log_manage(f"  新增offer: {len(new_offers)} 个")
             self.log_manage("=" * 50)
             
         except Exception as e:
-            self.log_manage(f"更新offer时发生错误: {str(e)}")
+            self.log_manage(f"更新PB offer时发生错误: {str(e)}")
             import traceback
             self.log_manage(traceback.format_exc())
         finally:
             self._restore_manage_ui()
     
     def get_offers_by_brand(self, brand_id):
-        """按品牌ID获取offer（使用与获取offer功能相同的参数格式）"""
+        """按品牌ID获取offer，带超时/502重试，并返回成功状态。"""
         all_offers = []
         page = 1
         has_more = True
         
         # 跳过无效的brand_id
         if not brand_id or str(brand_id).strip() in ['', 'None']:
-            return all_offers
+            return {"success": False, "offers": [], "error": "brand_id为空"}
         
         url = f"{PB_API_BASE_URL}/api/datafeed/get_fba_products"
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        brand_id_str = str(brand_id).strip()
         
         while has_more:
-            try:
-                # 使用与获取offer功能相同的参数格式
-                request_body = {
-                    "token": self.pb_token_var.get().strip(),
-                    "page_size": 100,
-                    "page": page,
-                    "default_filter": 0,
-                    "country_code": "",
-                    "brand_id": str(brand_id).strip(),  # 字符串格式
-                    "sort": "",
-                    "asins": "",
-                    "relationship": 1,  # 重要：必须是1
-                    "is_original_currency": 0,
-                    "has_promo_code": 0,
-                    "has_acc": 0,
-                    "filter_sexual_wellness": 0
-                }
-                
-                resp = requests.post(url, json=request_body, headers=headers, timeout=60)
-                
-                if resp.status_code == 200:
-                    data = resp.json()
+            page_success = False
+            last_error = ""
+            for attempt in range(1, 4):
+                try:
+                    # 使用与获取offer功能相同的参数格式
+                    request_body = {
+                        "token": self.pb_token_var.get().strip(),
+                        "page_size": 100,
+                        "page": page,
+                        "default_filter": 0,
+                        "country_code": "",
+                        "brand_id": brand_id_str,
+                        "sort": "",
+                        "asins": "",
+                        "relationship": 1,
+                        "is_original_currency": 0,
+                        "has_promo_code": 0,
+                        "has_acc": 0,
+                        "filter_sexual_wellness": 0
+                    }
                     
-                    if data.get("status", {}).get("code") == 0:
-                        offers = data.get("data", {}).get("list", [])
-                        has_more = data.get("data", {}).get("has_more", False)
-                        all_offers.extend(offers)
-                        page += 1
-                    else:
-                        self.log_manage(f"    API错误: {data.get('status', {}).get('msg')}")
+                    resp = requests.post(url, json=request_body, headers=headers, timeout=60)
+                    
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        
+                        if data.get("status", {}).get("code") == 0:
+                            offers = data.get("data", {}).get("list", [])
+                            has_more = data.get("data", {}).get("has_more", False)
+                            all_offers.extend(offers)
+                            page += 1
+                            page_success = True
+                            break
+                        error_msg = str(data.get("status", {}).get("msg") or data.get("status", {}).get("message") or "未知错误")
+                        self.log_manage(f"    API错误: {error_msg}")
+                        return {"success": False, "offers": all_offers, "error": f"API错误: {error_msg}"}
+
+                    if resp.status_code == 502:
+                        last_error = "HTTP错误: 502"
+                        self.log_manage(f"    HTTP错误: 502 (重试 {attempt}/3)")
+                        if attempt < 3:
+                            time.sleep(1.5 * attempt)
+                            continue
                         break
-                else:
+
+                    last_error = f"HTTP错误: {resp.status_code}"
                     self.log_manage(f"    HTTP错误: {resp.status_code}")
+                    return {"success": False, "offers": all_offers, "error": last_error}
+                except (ReadTimeout, Timeout) as e:
+                    last_error = f"超时: {str(e)}"
+                    self.log_manage(f"    超时: {str(e)} (重试 {attempt}/3)")
+                    if attempt < 3:
+                        time.sleep(1.5 * attempt)
+                        continue
                     break
-                
-                time.sleep(0.1)
-                
-            except Exception as e:
-                self.log_manage(f"    异常: {str(e)}")
-                break
+                except Exception as e:
+                    last_error = f"异常: {str(e)}"
+                    self.log_manage(f"    异常: {str(e)}")
+                    return {"success": False, "offers": all_offers, "error": last_error}
+
+            if not page_success:
+                if not last_error:
+                    last_error = "未知错误"
+                return {"success": False, "offers": all_offers, "error": last_error}
+
+            time.sleep(0.1)
         
-        return all_offers
+        return {"success": True, "offers": all_offers, "error": ""}
     
     def _apply_offer_updates(self, token, updates, style_updates):
         """应用offer更新到飞书"""
@@ -3434,6 +3841,13 @@ class OfferToolApp:
                     },
                     "foreColor": "#FF0000"  # 红色字体
                 }
+            elif style_type == 'blue_bold':
+                style = {
+                    "font": {
+                        "bold": True
+                    },
+                    "foreColor": "#049FD7"
+                }
             else:  # black_normal
                 style = {
                     "font": {
@@ -3500,6 +3914,7 @@ class OfferToolApp:
         # 要写入的字段映射：列名 -> PB字段名（根据PB API返回的实际字段名）
         # 注意：产品链接不从PB直接获取(PB返回的是简单URL)，而是通过投放链接重定向获取完整版
         field_mapping = {
+            '状态': '_status',  # 新增PB offer固定标记为“新增”
             '投放链接': '_tracking_link',  # 特殊处理
             '国家代码': '_country',  # 特殊处理
             '品牌名称': 'brand_name',
@@ -3520,6 +3935,7 @@ class OfferToolApp:
         # 批量写入
         batch_size = 50
         current_row = first_empty_row
+        new_status_style_updates = []
         
         for i in range(0, len(valid_offers), batch_size):
             batch = valid_offers[i:i+batch_size]
@@ -3557,6 +3973,8 @@ class OfferToolApp:
                     # 获取值
                     if col_name == '投放链接':
                         value = tracking_link or ''
+                    elif col_name == '状态':
+                        value = '新增'
                     elif col_name == '国家代码':
                         value = country
                     elif col_name == 'ASIN':
@@ -3572,6 +3990,8 @@ class OfferToolApp:
                         "range": range_str,
                         "values": [[value]]
                     })
+                    if col_name == '状态':
+                        new_status_style_updates.append((current_row, col_idx, 'blue_bold'))
                 
                 self.log_manage(f"    新增: {asin}_{country} - {offer.get('brand_name', '')}")
                 current_row += 1
@@ -3593,6 +4013,9 @@ class OfferToolApp:
                 self.log_manage(f"    成功写入 {len(batch)} 个新offer")
             
             time.sleep(0.3)
+
+        if new_status_style_updates:
+            self._apply_style_updates(token, new_status_style_updates)
     
     def _find_first_empty_row(self, token, spreadsheet_token, sheet_id, asin_col_idx):
         """找到第一个空白行（基于ASIN列，只要文本为空就算空白）"""
@@ -3924,8 +4347,7 @@ class OfferToolApp:
             yp_gross_commission_total = 0.0
             yp_missing_asin_brand = 0
 
-            offer_groups = self.build_offer_row_groups(feishu_data)
-            yp_pid_brand_to_asin_brand = {}
+            yp_pid_brand_to_offer_keys = {}
             for row in feishu_data:
                 if str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT:
                     continue
@@ -3934,11 +4356,15 @@ class OfferToolApp:
                     continue
                 asin = str(row.get('ASIN', '') or '').strip()
                 brand_id = str(row.get('品牌ID', '') or '').strip()
+                country = self.normalize_country_code(row.get('国家代码', '') or '')
                 if not asin or not brand_id:
                     continue
+                yp_marker = self.extract_yp_offer_marker(link, row.get('产品链接', ''))
                 pid_match = re.search(r'[?&]pid=([^&]+)', link, re.IGNORECASE)
                 if pid_match:
-                    yp_pid_brand_to_asin_brand[(pid_match.group(1), brand_id)] = (asin, brand_id)
+                    yp_pid_brand_to_offer_keys.setdefault((pid_match.group(1), brand_id), []).append(
+                        (asin, brand_id, country, yp_marker)
+                    )
 
             for trans in yp_commission_data:
                 comm = float(trans.get('sale_comm', 0) or 0)
@@ -3954,7 +4380,12 @@ class OfferToolApp:
                     yp_missing_asin_brand += 1
                     continue
 
-                key = (asin, brand_id)
+                pid_key = (advert_id, brand_id)
+                candidate_offer_keys = yp_pid_brand_to_offer_keys.get(pid_key, [])
+                if len(candidate_offer_keys) == 1:
+                    key = candidate_offer_keys[0]
+                else:
+                    key = (asin, brand_id, '', '')
                 if key not in yp_asin_brand_commission:
                     yp_asin_brand_commission[key] = {'non_rejected': 0.0, 'gross': 0.0, 'rejected': 0.0}
                 yp_asin_brand_commission[key]['gross'] += comm
@@ -4183,9 +4614,12 @@ class OfferToolApp:
                 if mcc_total_cost is not None:
                     total_cost_sum = mcc_total_cost
                 else:
-                    # 回退：使用campaign_data中的花费（不含已删除）
-                    total_cost_sum = sum(c.get('cost_usd', 0) for c in campaign_data)
-                    self.log_manage(f"  ⚠ 无法获取MCC全部花费，使用当前广告系列花费")
+                    current_campaign_cost_sum = sum(c.get('cost_usd', 0) for c in campaign_data)
+                    total_cost_sum = self.get_last_successful_summary_total_cost(min_cost=current_campaign_cost_sum)
+                    if total_cost_sum is None:
+                        self.log_manage(f"  ⚠ 无法获取MCC全部花费，本次保留总计行原有广告花费")
+                    else:
+                        self.log_manage(f"  ⚠ 无法获取MCC全部花费，恢复最近一次成功总计花费 ${total_cost_sum:.2f}")
                 
                 self.log_manage(f"  飞书表格所有Offer汇总:")
                 combined_non_rejected_commission_total = non_rejected_commission_total + yp_non_rejected_commission_total
@@ -4195,7 +4629,10 @@ class OfferToolApp:
                 self.log_manage(f"    • 非Rejected佣金: ${combined_non_rejected_commission_total:.2f}")
                 self.log_manage(f"    • 总佣金: ${combined_gross_commission_total:.2f}")
                 self.log_manage(f"    • Rejected佣金: ${combined_rejected_commission_total:.2f}")
-                self.log_manage(f"    • MCC总花费(USD): ${total_cost_sum:.2f}")
+                if total_cost_sum is None:
+                    self.log_manage(f"    • MCC总花费(USD): 保留原值")
+                else:
+                    self.log_manage(f"    • MCC总花费(USD): ${total_cost_sum:.2f}")
                 
                 # 更新第二行（总计行），传入未匹配佣金和Rejected佣金
                 self.update_feishu_summary_row(
@@ -4444,6 +4881,7 @@ class OfferToolApp:
                     'final_url_suffix': campaign.get('final_url_suffix', ''),
                     'clicks': 0,
                     'avg_cpc_usd': 0.0,
+                    'preset_cpc_usd': float(campaign.get('preset_cpc_usd', 0.0) or 0.0),
                     '_cpc_weighted_cost': 0.0,
                     '_cpc_weighted_clicks': 0,
                     '_traffic_source': 'pb',
@@ -4461,6 +4899,7 @@ class OfferToolApp:
             )
             campaign_clicks = int(campaign.get('clicks', 0) or 0)
             campaign_avg_cpc = float(campaign.get('avg_cpc_usd', 0.0) or 0.0)
+            campaign_preset_cpc = float(campaign.get('preset_cpc_usd', 0.0) or 0.0)
             mcc_campaigns[campaign_name]['clicks'] += campaign_clicks
             if campaign_clicks > 0:
                 mcc_campaigns[campaign_name]['_cpc_weighted_cost'] += campaign_avg_cpc * campaign_clicks
@@ -4470,6 +4909,8 @@ class OfferToolApp:
                     mcc_campaigns[campaign_name]['avg_cpc_usd'] = (
                         mcc_campaigns[campaign_name]['_cpc_weighted_cost'] / total_clicks_for_cpc
                     )
+            if campaign_preset_cpc > mcc_campaigns[campaign_name].get('preset_cpc_usd', 0.0):
+                mcc_campaigns[campaign_name]['preset_cpc_usd'] = campaign_preset_cpc
             
             # 如果之前没有ASIN/国家，尝试从当前campaign获取
             if not mcc_campaigns[campaign_name]['asin'] and campaign.get('asin'):
@@ -4498,6 +4939,7 @@ class OfferToolApp:
         existing_campaign_status = {}  # {campaign_name: str} 上次运行时的状态
         existing_campaign_clicks = {}  # {campaign_name: str}
         existing_campaign_cpc = {}  # {campaign_name: str}
+        existing_campaign_preset_cpc = {}  # {campaign_name: str}
         for row_data in existing_rows:
             name = row_data.get('广告系列名称', '')
             row_idx = row_data.get('row_index')
@@ -4518,6 +4960,7 @@ class OfferToolApp:
                 existing_campaign_status[name] = str(row_data.get('状态', '') or '').strip()
                 existing_campaign_clicks[name] = str(row_data.get('总点击数', '') or '').strip()
                 existing_campaign_cpc[name] = str(row_data.get('CPC', '') or '').strip()
+                existing_campaign_preset_cpc[name] = str(row_data.get('预设CPC', '') or '').strip()
 
         existing_campaign_row_info = {}
         for row_data in existing_rows:
@@ -4531,6 +4974,8 @@ class OfferToolApp:
                     'row_index': row_idx,
                     'campaign_name': name,
                     'status': status,
+                    'tracking_link': row_data.get('投放链接', ''),
+                    'product_link': row_data.get('产品链接', ''),
                 }
 
         def extract_tracking_uid(link):
@@ -4764,6 +5209,7 @@ class OfferToolApp:
             )
             total_clicks = int(campaign_info.get('clicks', 0) or 0)
             avg_cpc_usd = float(campaign_info.get('avg_cpc_usd', 0.0) or 0.0)
+            preset_cpc_usd = float(campaign_info.get('preset_cpc_usd', 0.0) or 0.0)
             if preserve_existing_cost:
                 preserved_campaign_cost_rows.append({
                     'campaign_name': campaign_name,
@@ -4780,7 +5226,10 @@ class OfferToolApp:
 
             offer_group_key, offer_group_summary = self.resolve_yp_campaign_offer_group(
                 campaign_name,
-                campaign_info,
+                {
+                    **campaign_info,
+                    'product_link': product_link_url,
+                },
                 yp_offer_context,
                 tracking_link_to_write
             )
@@ -4805,6 +5254,7 @@ class OfferToolApp:
                 '已启用关键字CTR': f"{enabled_keyword_ctr:.2f}%",
                 '总点击数': total_clicks,
                 'CPC': f"${avg_cpc_usd:.2f}" if total_clicks > 0 else "$0.00",
+                '预设CPC': f"${preset_cpc_usd:.2f}" if preset_cpc_usd > 0 else "$0.00",
                 '新增广告系列花费': None if preserve_existing_cost else f"${cost_increment:.2f}",
                 '新增佣金': f"${commission_increment:.2f}",
                 'status_color': status_color,
@@ -4850,6 +5300,7 @@ class OfferToolApp:
                             'country': '',
                             'campaign_id': '',
                             'tracking_link': existing_tracking_link,
+                            'product_link': existing_campaign_row_info.get(campaign_name, {}).get('product_link', ''),
                         },
                         yp_offer_context,
                         existing_tracking_link
@@ -4876,6 +5327,7 @@ class OfferToolApp:
                         'country': '',
                         'campaign_id': '',
                         'tracking_link': existing_tracking_link,
+                        'product_link': existing_campaign_row_info.get(campaign_name, {}).get('product_link', ''),
                     },
                     yp_offer_context,
                     existing_tracking_link
@@ -4898,6 +5350,8 @@ class OfferToolApp:
                 if not existing_campaign_cpc.get(campaign_name, '') and ('avg_cpc_usd' in removed_metrics):
                     clicks = int(removed_metrics.get('clicks', 0) or 0)
                     ended_update['CPC'] = f"${float(removed_metrics.get('avg_cpc_usd', 0.0) or 0.0):.2f}" if clicks > 0 else "$0.00"
+                if not existing_campaign_preset_cpc.get(campaign_name, '') and ('preset_cpc_usd' in removed_metrics):
+                    ended_update['预设CPC'] = f"${float(removed_metrics.get('preset_cpc_usd', 0.0) or 0.0):.2f}" if float(removed_metrics.get('preset_cpc_usd', 0.0) or 0.0) > 0 else "$0.00"
                 updates.append(ended_update)
         
         final_campaign_rows = {}
@@ -5027,7 +5481,7 @@ class OfferToolApp:
         return report
 
     def backfill_ended_campaign_metrics_once(self, start_date_str, end_date_str):
-        """一次性回填广告系列表中“投放已结束”行的总点击数和CPC。"""
+        """一次性回填广告系列表中“投放已结束”行的总点击数、CPC和预设CPC。"""
         campaigns_spreadsheet_token = "KnJ1wphpBiVMrGkWl5ncUkMGnfe"
         campaigns_sheet_id = "XrkOF7"
 
@@ -5053,6 +5507,7 @@ class OfferToolApp:
         ended_row_index_by_name = {}
         existing_clicks = {}
         existing_cpc = {}
+        existing_preset_cpc = {}
         for row_data in existing_rows:
             status = str(row_data.get('状态', '') or '').strip()
             if status != '投放已结束':
@@ -5065,15 +5520,18 @@ class OfferToolApp:
 
             clicks_value = str(row_data.get('总点击数', '') or '').strip()
             cpc_value = str(row_data.get('CPC', '') or '').strip()
+            preset_cpc_value = str(row_data.get('预设CPC', '') or '').strip()
             needs_clicks_backfill = not clicks_value
             needs_cpc_backfill = not cpc_value
-            if not (needs_clicks_backfill or needs_cpc_backfill):
+            needs_preset_cpc_backfill = not preset_cpc_value
+            if not (needs_clicks_backfill or needs_cpc_backfill or needs_preset_cpc_backfill):
                 continue
 
             ended_candidates.append(campaign_name)
             ended_row_index_by_name[campaign_name] = row_idx
             existing_clicks[campaign_name] = clicks_value
             existing_cpc[campaign_name] = cpc_value
+            existing_preset_cpc[campaign_name] = preset_cpc_value
 
         if not ended_candidates:
             self.log_manage("  没有需要补录点击数/CPC的“投放已结束”广告系列")
@@ -5106,6 +5564,11 @@ class OfferToolApp:
             if not existing_cpc.get(campaign_name, '') and ('avg_cpc_usd' in removed_metrics):
                 clicks = int(removed_metrics.get('clicks', 0) or 0)
                 update['CPC'] = f"${float(removed_metrics.get('avg_cpc_usd', 0.0) or 0.0):.2f}" if clicks > 0 else "$0.00"
+                wrote_any = True
+
+            if not existing_preset_cpc.get(campaign_name, '') and ('preset_cpc_usd' in removed_metrics):
+                preset_cpc_usd = float(removed_metrics.get('preset_cpc_usd', 0.0) or 0.0)
+                update['预设CPC'] = f"${preset_cpc_usd:.2f}" if preset_cpc_usd > 0 else "$0.00"
                 wrote_any = True
 
             if wrote_any:
@@ -5343,7 +5806,7 @@ class OfferToolApp:
         # 定义字段到列的映射（完全基于表头文字匹配，不使用硬编码列位置）
         all_fields = ['状态', '广告系列名称', '投放中的ads', '投放链接', '广告系列总花费', 
                       '总佣金', 'ROI', '佣金ASIN', '每单佣金', '产品链接', '已启用关键字CTR',
-                      '总点击数', 'CPC', '品牌收支平衡CPC',
+                      '总点击数', 'CPC', '预设CPC', '品牌收支平衡CPC',
                       '新增广告系列花费', '新增佣金']
         field_to_column = {}
         missing_fields = []
@@ -5497,6 +5960,7 @@ class OfferToolApp:
             rows_now, _, _ = self.read_campaigns_sheet(token, spreadsheet_token, sheet_id)
             group_to_rows = {}
             summary_rows = {}
+            summary_rows_by_key = {}
             row_by_index = {}
             ordered_rows = []
 
@@ -5518,8 +5982,18 @@ class OfferToolApp:
                         asin = parts[0]
                         brand_id = parts[1]
                         country = self.normalize_country_code(parts[2])
+                        yp_marker = parts[3] if len(parts) >= 4 else ''
                         if asin and country:
-                            summary_rows[(asin, brand_id, country)] = row_index
+                            summary_key = (asin, brand_id, country, yp_marker)
+                            if yp_marker.startswith('adg:'):
+                                matched_summary_key = None
+                                for source_key, source_summary in yp_offer_context.get('offer_group_summary_by_key', {}).items():
+                                    if source_key == summary_key:
+                                        matched_summary_key = self.get_yp_campaign_group_key(source_key, source_summary)
+                                        break
+                                summary_key = matched_summary_key or summary_key
+                            summary_rows_by_key.setdefault(summary_key, []).append(row_index)
+                            summary_rows[summary_key] = row_index
                     continue
 
                 campaign_info = mcc_campaigns.get(campaign_name)
@@ -5538,6 +6012,7 @@ class OfferToolApp:
                             'country': '',
                             'campaign_id': '',
                             'tracking_link': tracking_link,
+                            'product_link': row.get('产品链接', ''),
                         },
                         yp_offer_context,
                         tracking_link
@@ -5546,11 +6021,50 @@ class OfferToolApp:
                 if not offer_key:
                     continue
 
-                group_to_rows.setdefault(offer_key, []).append(row_index)
+                offer_summary = yp_offer_context.get('offer_group_summary_by_key', {}).get(offer_key, {}) or {}
+                campaign_group_key = self.get_yp_campaign_group_key(offer_key, offer_summary)
+                if not campaign_group_key:
+                    continue
+                group_to_rows.setdefault(campaign_group_key, []).append(row_index)
 
-            return rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows
+            return rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows, summary_rows_by_key
 
-        rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows = build_campaign_offer_group_map()
+        rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows, summary_rows_by_key = build_campaign_offer_group_map()
+
+        duplicate_summary_rows_to_delete = []
+        for offer_key, summary_row_indices in summary_rows_by_key.items():
+            if len(summary_row_indices) <= 1:
+                continue
+            group_rows = sorted(group_to_rows.get(offer_key, []))
+            if group_rows:
+                keep_row = min(summary_row_indices, key=lambda ri: (abs(ri - group_rows[0]), ri))
+            else:
+                keep_row = min(summary_row_indices)
+            duplicate_summary_rows_to_delete.extend(ri for ri in summary_row_indices if ri != keep_row)
+
+        summary_rows_by_base_key = {}
+        for summary_key, row_indices in summary_rows_by_key.items():
+            if len(summary_key) < 3:
+                continue
+            base_key = summary_key[:3]
+            for row_index in row_indices:
+                summary_rows_by_base_key.setdefault(base_key, []).append((summary_key, row_index))
+
+        for base_key, summary_items in summary_rows_by_base_key.items():
+            has_marked_summary = any(len(summary_key) > 3 and summary_key[3] for summary_key, _ in summary_items)
+            if not has_marked_summary:
+                continue
+            for summary_key, row_index in summary_items:
+                if len(summary_key) <= 3 or not summary_key[3]:
+                    duplicate_summary_rows_to_delete.append(row_index)
+
+        duplicate_summary_rows_to_delete = sorted(set(duplicate_summary_rows_to_delete))
+        if duplicate_summary_rows_to_delete:
+            if not self.delete_sheet_rows(token, spreadsheet_token, sheet_id, duplicate_summary_rows_to_delete):
+                raise RuntimeError("无法删除重复的广告系列相同offer统计行")
+            self.log_manage(f"  已清理 {len(duplicate_summary_rows_to_delete)} 条重复的广告系列相同offer统计行")
+            rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows, summary_rows_by_key = build_campaign_offer_group_map()
+
         duplicate_groups = {k: v for k, v in group_to_rows.items() if len(v) > 1}
         if not duplicate_groups:
             self.log_manage("  未发现需要写入统计行的YP广告系列相同offer分组")
@@ -5564,12 +6078,24 @@ class OfferToolApp:
         )
 
         for offer_key in group_order:
-            rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows = build_campaign_offer_group_map()
+            rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows, summary_rows_by_key = build_campaign_offer_group_map()
             rows = sorted(group_to_rows.get(offer_key, []))
             if len(rows) <= 1:
                 continue
 
             target = rows[0]
+            summary_row_index = summary_rows.get(offer_key)
+            if summary_row_index is not None and summary_row_index != target - 1:
+                src_0based = summary_row_index - 1
+                dst_0based = target - 1
+                if summary_row_index < target:
+                    dst_0based = target - 2
+                if not self.feishu_move_dimension(token, spreadsheet_token, sheet_id, src_0based, src_0based, dst_0based):
+                    raise RuntimeError(f"无法移动广告系列统计行 {offer_key}")
+                rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows, summary_rows_by_key = build_campaign_offer_group_map()
+                rows = sorted(group_to_rows.get(offer_key, rows))
+                target = rows[0]
+
             desired = list(range(target, target + len(rows)))
             if rows != desired:
                 working_order = list(ordered_rows)
@@ -5586,7 +6112,7 @@ class OfferToolApp:
                     moved = working_order.pop(current_pos)
                     working_order.insert(desired_pos, moved)
 
-                rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows = build_campaign_offer_group_map()
+                rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows, summary_rows_by_key = build_campaign_offer_group_map()
                 rows = sorted(group_to_rows.get(offer_key, rows))
                 target = rows[0]
 
@@ -5596,10 +6122,15 @@ class OfferToolApp:
                 if not self.insert_sheet_rows(token, spreadsheet_token, sheet_id, start_index_0based=target - 1, count=1):
                     raise RuntimeError(f"无法为广告系列分组 {offer_key} 插入统计行")
                 rows = [ri + 1 if ri >= summary_row_index else ri for ri in rows]
-                rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows = build_campaign_offer_group_map()
+                rows_now, row_by_index, ordered_rows, group_to_rows, summary_rows, summary_rows_by_key = build_campaign_offer_group_map()
 
-            asin, brand_id, country = offer_key
-            offer_summary = yp_offer_context.get('offer_group_summary_by_key', {}).get(offer_key, {}) or {}
+            asin, brand_id, country = offer_key[:3]
+            yp_marker = offer_key[3] if len(offer_key) > 3 else ''
+            offer_summary = {}
+            for source_key, source_summary in yp_offer_context.get('offer_group_summary_by_key', {}).items():
+                if self.get_yp_campaign_group_key(source_key, source_summary) == offer_key:
+                    offer_summary = source_summary or {}
+                    break
             metrics = self.summarize_campaign_group_rows(row_by_index, rows)
             total_cost = metrics.get('total_cost', 0.0)
             total_commission = metrics.get('total_commission', 0.0)
@@ -5608,6 +6139,8 @@ class OfferToolApp:
             total_clicks = metrics.get('total_clicks', 0)
             roi_value = round(total_commission / total_cost, 1) if total_cost > 0 else 0
             summary_label = f"{asin} | {brand_id} | {country}"
+            if yp_marker:
+                summary_label = f"{summary_label} | {yp_marker}"
             updates = []
             style_updates = []
             summary_values = {
@@ -5649,7 +6182,7 @@ class OfferToolApp:
                 self.apply_campaigns_style_updates(token, spreadsheet_token, sheet_id, style_updates)
 
             self.log_manage(
-                f"    已生成广告系列统计行: ASIN={asin}, 品牌ID={brand_id or '-'}, 国家={country}, 汇总{len(rows)}个广告系列"
+                f"    已生成广告系列统计行: ASIN={asin}, 品牌ID={brand_id or '-'}, 国家={country}, 分组={yp_marker or '-'}, 汇总{len(rows)}个广告系列"
             )
     
     def get_all_campaigns_with_asin(self, start_date_str=None, end_date_str=None):
@@ -5735,6 +6268,7 @@ class OfferToolApp:
                                 'uids': set(),
                                 'clicks': 0,
                                 'avg_cpc_usd': 0.0,
+                                'preset_cpc_usd': 0.0,
                                 'enabled_keyword_ctr_weighted_numerator': 0.0,
                                 'enabled_keyword_ctr_impressions': 0
                             }
@@ -5777,6 +6311,7 @@ class OfferToolApp:
                                 'uids': set(),
                                 'clicks': 0,
                                 'avg_cpc_usd': 0.0,
+                                'preset_cpc_usd': 0.0,
                                 'enabled_keyword_ctr_weighted_numerator': 0.0,
                                 'enabled_keyword_ctr_impressions': 0
                             }
@@ -5824,10 +6359,33 @@ class OfferToolApp:
                         if ad_uid:
                             campaign_info[campaign_id]['uids'].add(ad_uid)
 
+                    # 查询广告组层级预设出价，优先取每个campaign中的最高值作为展示口径。
+                    ad_group_bid_query = """
+                        SELECT
+                            campaign.id,
+                            ad_group.cpc_bid_micros
+                        FROM ad_group
+                        WHERE campaign.status != 'REMOVED'
+                            AND ad_group.status != 'REMOVED'
+                    """
+                    ad_group_bid_response = ga_service.search(customer_id=account['id'], query=ad_group_bid_query)
+                    for row in ad_group_bid_response:
+                        campaign_id = str(row.campaign.id)
+                        if campaign_id not in campaign_info:
+                            continue
+                        cpc_bid_micros = int(row.ad_group.cpc_bid_micros or 0)
+                        if cpc_bid_micros <= 0:
+                            continue
+                        preset_cpc_original = cpc_bid_micros / 1_000_000
+                        preset_cpc_usd = preset_cpc_original * CNY_TO_USD_RATE if account_currency == 'CNY' else preset_cpc_original
+                        if preset_cpc_usd > campaign_info[campaign_id].get('preset_cpc_usd', 0.0):
+                            campaign_info[campaign_id]['preset_cpc_usd'] = preset_cpc_usd
+
                     # 用统计日期范围在campaign级别汇总花费，避免广告级查询把历史花费漏掉后写成0。
                     cost_query = """
                         SELECT
                             campaign.id,
+                            campaign.target_spend.cpc_bid_ceiling_micros,
                             metrics.cost_micros,
                             metrics.clicks,
                             metrics.average_cpc
@@ -5847,16 +6405,21 @@ class OfferToolApp:
                             continue
 
                         cost_in_original = row.metrics.cost_micros / 1000000 if row.metrics.cost_micros else 0
+                        preset_cpc_original = (row.campaign.target_spend.cpc_bid_ceiling_micros / 1000000) if row.campaign.target_spend.cpc_bid_ceiling_micros else 0
                         if account_currency == 'CNY':
                             cost_in_usd = cost_in_original * CNY_TO_USD_RATE
                             avg_cpc_in_usd = (row.metrics.average_cpc / 1000000) * CNY_TO_USD_RATE if row.metrics.average_cpc else 0
+                            preset_cpc_usd = preset_cpc_original * CNY_TO_USD_RATE if preset_cpc_original else 0
                         else:
                             cost_in_usd = cost_in_original
                             avg_cpc_in_usd = (row.metrics.average_cpc / 1000000) if row.metrics.average_cpc else 0
+                            preset_cpc_usd = preset_cpc_original
                         campaign_info[campaign_id]['cost_usd'] += cost_in_usd
                         campaign_info[campaign_id]['clicks'] += int(row.metrics.clicks or 0)
                         if avg_cpc_in_usd > 0:
                             campaign_info[campaign_id]['avg_cpc_usd'] = avg_cpc_in_usd
+                        if preset_cpc_usd > campaign_info[campaign_id].get('preset_cpc_usd', 0.0):
+                            campaign_info[campaign_id]['preset_cpc_usd'] = preset_cpc_usd
 
                     # 查询关键词层级指标，汇总“启用且有点击”的关键词CTR加权平均所需数据
                     keyword_query = """
@@ -6226,7 +6789,7 @@ class OfferToolApp:
         return row_campaigns
 
     def get_removed_campaign_metrics(self, start_date_str=None, end_date_str=None, campaign_names=None):
-        """一次性汇总已移除广告系列的点击数与平均CPC。"""
+        """一次性汇总已移除广告系列的点击数、真实CPC与预设CPC。"""
         removed_metrics = {}
         target_names = {str(name).strip() for name in (campaign_names or []) if str(name).strip()}
         if not target_names:
@@ -6270,6 +6833,7 @@ class OfferToolApp:
                         SELECT
                             campaign.id,
                             campaign.name,
+                            campaign.target_spend.cpc_bid_ceiling_micros,
                             metrics.clicks,
                             metrics.average_cpc
                         FROM campaign
@@ -6289,17 +6853,22 @@ class OfferToolApp:
 
                         clicks = int(row.metrics.clicks or 0)
                         avg_cpc_original = (row.metrics.average_cpc / 1000000) if row.metrics.average_cpc else 0.0
+                        preset_cpc_original = (row.campaign.target_spend.cpc_bid_ceiling_micros / 1000000) if row.campaign.target_spend.cpc_bid_ceiling_micros else 0.0
                         avg_cpc_usd = avg_cpc_original * CNY_TO_USD_RATE if account_currency == 'CNY' else avg_cpc_original
+                        preset_cpc_usd = preset_cpc_original * CNY_TO_USD_RATE if account_currency == 'CNY' else preset_cpc_original
 
                         if campaign_name not in removed_metrics:
                             removed_metrics[campaign_name] = {
                                 'clicks': 0,
                                 'cost_for_cpc': 0.0,
+                                'preset_cpc_usd': 0.0,
                             }
                             matched_count += 1
 
                         removed_metrics[campaign_name]['clicks'] += clicks
                         removed_metrics[campaign_name]['cost_for_cpc'] += avg_cpc_usd * clicks
+                        if preset_cpc_usd > removed_metrics[campaign_name].get('preset_cpc_usd', 0.0):
+                            removed_metrics[campaign_name]['preset_cpc_usd'] = preset_cpc_usd
                 except Exception as e:
                     self.log_manage(f"  ⚠ 账户 {account['name']}({account['id']}) 汇总已移除广告系列指标失败: {str(e)[:100]}")
 
@@ -6354,7 +6923,7 @@ class OfferToolApp:
         for part in parts:
             part_upper = part.upper()
             if part_upper in country_codes:
-                return part_upper
+                return self.normalize_country_code(part_upper)
         
         # 也尝试用正则匹配，以防格式略有不同
         for code in country_codes:
@@ -6362,7 +6931,7 @@ class OfferToolApp:
             pattern = rf'[-_]({code})[-_]'
             match = re.search(pattern, campaign_name, re.IGNORECASE)
             if match:
-                return match.group(1).upper()
+                return self.normalize_country_code(match.group(1).upper())
         
         return None
 
@@ -6452,6 +7021,34 @@ class OfferToolApp:
                     return match.group(1).upper()
         
         return None
+
+    def normalize_offer_brand_sort_key(self, brand_name):
+        """Offer排序用品牌键：把“品牌名”和“品牌名+国家代码”视为同一品牌。"""
+        raw_text = str(brand_name or '').strip()
+        if not raw_text or raw_text.lower() in ('none', 'null'):
+            return ''
+        normalized = self.normalize_brand_key(brand_name)
+        if normalized:
+            return normalized
+
+        text = raw_text.lower()
+        text = re.sub(r'[\s\-_]+', ' ', text)
+        return text.strip()
+
+    def get_offer_sort_status_priority(self, status):
+        """Offer顺序整理状态优先级：已结束、暂停中、投放中、新增、新复制。"""
+        status_text = str(status or '').strip()
+        if status_text.startswith('投放已结束'):
+            return 0
+        if status_text.startswith('暂停中') or status_text.startswith('暂停') or status_text.startswith('广告系列暂停中'):
+            return 1
+        if status_text.startswith('投放中'):
+            return 2
+        if status_text.startswith('新增'):
+            return 3
+        if status_text.startswith('新复制'):
+            return 4
+        return 5
     
     def extract_country_from_mcid(self, mcid):
         """从 mcid 中提取国家代码
@@ -6560,6 +7157,17 @@ class OfferToolApp:
             result = chr(index % 26 + ord('A')) + result
             index = index // 26 - 1
         return result
+
+    def column_letter_to_index(self, column_letter):
+        """将Excel列字母转换为列索引（0开始）。"""
+        if not column_letter:
+            return None
+        index = 0
+        for ch in str(column_letter).strip().upper():
+            if not ('A' <= ch <= 'Z'):
+                return None
+            index = index * 26 + (ord(ch) - ord('A') + 1)
+        return index - 1
     
     def load_old_campaign_consume(self):
         """读取旧广告系列花费记录
@@ -7044,7 +7652,6 @@ class OfferToolApp:
         # 记录UID精确匹配失败后，回退到(ASIN+国家)的分配情况
         uid_fallback_events = []
         unresolved_uid_commissions = []
-        # 记录被0花费保护的offer行，避免本次异常0值覆盖旧值
         preserved_offer_cost_rows = []
         precomputed_row_commissions = {}
 
@@ -7161,13 +7768,22 @@ class OfferToolApp:
                 continue
             asin = str(row.get('ASIN', '') or '').strip()
             brand_id = str(row.get('品牌ID', '') or '').strip()
+            country = self.normalize_country_code(row.get('国家代码', '') or '')
             tracking_link = str(normalize_link_value(row.get('投放链接', '')) or '').strip()
             if not asin or not brand_id or not self._is_yp_tracking_link(tracking_link):
                 continue
-            yp_duplicate_groups.setdefault((asin, brand_id), []).append(row_index)
+            yp_marker = self.extract_yp_offer_marker(tracking_link, row.get('产品链接', ''))
+            yp_duplicate_groups.setdefault((asin, brand_id, country, yp_marker), []).append(row_index)
 
         for yp_key, yp_info in yp_asin_brand_commission.items():
             row_indices = yp_duplicate_groups.get(yp_key, [])
+            if not row_indices and len(yp_key) >= 2:
+                fallback_matches = [
+                    rows for key, rows in yp_duplicate_groups.items()
+                    if key[0] == yp_key[0] and key[1] == yp_key[1]
+                ]
+                if len(fallback_matches) == 1:
+                    row_indices = fallback_matches[0]
             if not row_indices:
                 continue
             target_row = min(row_indices)
@@ -7245,6 +7861,7 @@ class OfferToolApp:
                 'is_yp': self._is_yp_tracking_link(normalize_link_value(row_data.get('投放链接', ''))),
                 'commission': round(commission_value or 0.0, 2),
                 'tracking_link': normalize_link_value(row_data.get('投放链接', '')),
+                'product_link': normalize_link_value(row_data.get('产品链接', '')),
                 'campaign_names': campaign_names,
                 'campaign_ids': campaign_ids,
                 'uid_allocations': list(commission_result.get('uid_allocations', [])),
@@ -7679,6 +8296,92 @@ class OfferToolApp:
             time.sleep(0.3)  # 避免请求过快
         
         self.log_manage(f"  更新完成")
+
+    def repair_offer_total_costs_from_campaign_sheet(self, token):
+        """一次性按广告系列表重算Offer表“广告系列总花费”，只更新这一列。"""
+        spreadsheet_token = self.feishu_spreadsheet_var.get().strip()
+        offer_sheet_id = self.feishu_sheet_id_var.get().strip()
+        campaigns_sheet_id = "XrkOF7"
+
+        self.log_manage("\n【一次性修复】按广告系列表重算Offer表广告系列总花费...")
+        offer_rows = self.get_feishu_sheet_data(token)
+        if not offer_rows:
+            self.log_manage("  无法读取Offer表数据")
+            return {'updated': 0, 'rows': 0}
+
+        campaign_sheet_data = self.read_campaigns_sheet(token, spreadsheet_token, campaigns_sheet_id)
+        if not campaign_sheet_data:
+            self.log_manage("  无法读取广告系列表数据")
+            return {'updated': 0, 'rows': 0}
+
+        campaign_rows, _, _ = campaign_sheet_data
+        cost_by_campaign_name = {}
+        for row in campaign_rows or []:
+            status = str(row.get('状态', '') or '').strip()
+            if status == SUMMARY_STATUS_TEXT:
+                continue
+            campaign_name = str(row.get('广告系列名称', '') or '').strip()
+            if not campaign_name:
+                continue
+            cost_by_campaign_name[campaign_name] = self.parse_commission_value(row.get('广告系列总花费', ''))
+
+        cost_col_letter = self.feishu_column_map.get('广告系列总花费')
+        cost_col_idx = self.column_letter_to_index(cost_col_letter)
+        if cost_col_idx is None:
+            self.log_manage("  Offer表缺少“广告系列总花费”列")
+            return {'updated': 0, 'rows': 0}
+
+        updates = []
+        checked_rows = 0
+        for row in offer_rows:
+            row_index = row.get('row_index')
+            if not row_index:
+                continue
+            status = str(row.get('状态', '') or '').strip()
+            if status == SUMMARY_STATUS_TEXT:
+                continue
+
+            campaign_names_raw = str(row.get('广告系列名称', '') or '').strip()
+            if not campaign_names_raw:
+                continue
+
+            campaign_names = [name.strip() for name in campaign_names_raw.split(',') if name.strip()]
+            if not campaign_names:
+                continue
+
+            checked_rows += 1
+            total_cost = 0.0
+            found_campaign = False
+            for campaign_name in campaign_names:
+                if campaign_name in cost_by_campaign_name:
+                    total_cost += float(cost_by_campaign_name.get(campaign_name, 0.0) or 0.0)
+                    found_campaign = True
+
+            if not found_campaign:
+                continue
+
+            normalized_total_cost = round(total_cost, 2)
+            current_cost = self.parse_commission_value(row.get('广告系列总花费', ''))
+            if abs(current_cost - normalized_total_cost) <= 0.0001:
+                continue
+
+            updates.append((row_index, cost_col_idx, f"${normalized_total_cost:.2f}"))
+
+        self.log_manage(f"  广告系列表中读取到 {len(cost_by_campaign_name)} 个广告系列")
+        self.log_manage(f"  检查了 {checked_rows} 行带广告系列名称的Offer")
+        self.log_manage(f"  准备修复 {len(updates)} 行Offer的“广告系列总花费”")
+
+        if not updates:
+            self.log_manage("  无需修复")
+            return {'updated': 0, 'rows': checked_rows}
+
+        success = self._batch_update_sheet_cells(token, spreadsheet_token, updates, sheet_id=offer_sheet_id)
+        if success:
+            self.log_manage("  Offer表“广告系列总花费”修复完成")
+        else:
+            self.log_manage("  Offer表“广告系列总花费”修复存在部分失败")
+
+        return {'updated': len(updates), 'rows': checked_rows}
     
     def batch_update_cell_styles(self, token, spreadsheet_token, sheet_id, style_updates):
         """批量更新单元格样式（字体颜色+加粗）"""
@@ -7798,6 +8501,28 @@ class OfferToolApp:
             
         except Exception as e:
             self.log_manage(f"  获取MCC总花费失败: {e}")
+            return None
+
+    def get_last_successful_summary_total_cost(self, min_cost=None):
+        """从日志中读取最近一次成功写入的总计行花费，用于MCC限流时恢复。"""
+        try:
+            if not os.path.exists(LOG_FILE):
+                return None
+            last_cost = None
+            pattern = re.compile(r'总计行更新成功: .*总花费=\$([0-9,]+(?:\.[0-9]+)?)')
+            with open(LOG_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if '总花费保留原值' in line:
+                        continue
+                    match = pattern.search(line)
+                    if match:
+                        cost = float(match.group(1).replace(',', ''))
+                        if min_cost is not None and cost <= float(min_cost or 0.0) + 0.01:
+                            continue
+                        last_cost = cost
+            return last_cost
+        except Exception as e:
+            self.log_manage(f"  读取最近一次总计花费失败: {str(e)[:80]}")
             return None
 
     def get_mcc_daily_costs(self, start_date_str, end_date_str):
@@ -7924,13 +8649,13 @@ class OfferToolApp:
 
         return results
     
-    def update_feishu_summary_row(self, token, non_rejected_commission, total_cost, gross_commission=0, rejected_commission=0):
+    def update_feishu_summary_row(self, token, non_rejected_commission, total_cost=None, gross_commission=0, rejected_commission=0):
         """更新飞书表格第二行'总计'行的汇总数据
         
         参数:
             token: 飞书访问令牌
             non_rejected_commission: 非Rejected佣金
-            total_cost: 总花费
+            total_cost: 总花费；None 表示保留原值
             gross_commission: 总佣金（含Rejected）
             rejected_commission: Rejected状态的佣金
         """
@@ -7960,13 +8685,13 @@ class OfferToolApp:
             self.log_manage("  警告：未找到'总佣金'列")
         
         # 广告系列总花费列
-        if '广告系列总花费' in column_map:
+        if total_cost is not None and '广告系列总花费' in column_map:
             col = column_map['广告系列总花费']
             value_ranges.append({
                 'range': f"{sheet_id}!{col}2:{col}2",
                 'values': [[f"${total_cost:.2f}"]]
             })
-        else:
+        elif total_cost is not None:
             self.log_manage("  警告：未找到'广告系列总花费'列")
         
         if not value_ranges:
@@ -7983,7 +8708,10 @@ class OfferToolApp:
             if result.get('code') != 0:
                 self.log_manage(f"  更新总计行失败 (code={result.get('code')}): {result.get('msg', 'Unknown error')}")
             else:
-                self.log_manage(f"  ✅ 总计行更新成功: 总佣金=${non_rejected_commission:.2f} (${gross_commission:.2f}-${rejected_commission:.2f}), 总花费=${total_cost:.2f}")
+                if total_cost is None:
+                    self.log_manage(f"  ✅ 总计行更新成功: 总佣金=${non_rejected_commission:.2f} (${gross_commission:.2f}-${rejected_commission:.2f}), 总花费保留原值")
+                else:
+                    self.log_manage(f"  ✅ 总计行更新成功: 总佣金=${non_rejected_commission:.2f} (${gross_commission:.2f}-${rejected_commission:.2f}), 总花费=${total_cost:.2f}")
         except Exception as e:
             self.log_manage(f"  更新总计行异常: {e}")
 
@@ -8045,6 +8773,7 @@ class OfferToolApp:
                 and str(existing_summary_row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT
                 and str(existing_summary_row.get('ASIN', '') or '').strip() == key[0]
                 and str(existing_summary_row.get('品牌ID', '') or '').strip() == str(key[1])
+                and self.normalize_country_code(existing_summary_row.get('国家代码', '') or '') == (key[2] or '')
             ):
                 summary_row_index = target - 1
             else:
@@ -8339,16 +9068,210 @@ class OfferToolApp:
         elapsed_total = time.time() - start_time
         self.log_manage(f"    排序完成: {move_count}/{expected_moves} 次移动，耗时 {elapsed_total:.0f} 秒")
         return move_count
+
+    def sort_pb_offer_rows_by_brand(self, token):
+        """按品牌整理Offer表中的PB行，覆盖历史已新增但未归位的PB offer。"""
+        self.log_manage("  按品牌整理PB offer行...")
+
+        spreadsheet_token = self.feishu_spreadsheet_var.get().strip()
+        sheet_id = self.feishu_sheet_id_var.get().strip()
+        feishu_data = self.get_feishu_sheet_data(token)
+        column_map = getattr(self, 'feishu_column_map', {}) or {}
+        if not feishu_data or not column_map:
+            self.log_manage("    无法读取Offer表格数据")
+            return 0
+
+        row_by_index = {}
+        last_data_ri = 0
+        col_indices = {}
+        for header, col_letter in column_map.items():
+            col_idx = self.column_letter_to_index(col_letter)
+            if col_idx is not None:
+                col_indices[header] = col_idx
+
+        for row in feishu_data:
+            ri = row.get('row_index')
+            if ri is None or ri < 3:
+                continue
+            has_content = (
+                row.get('ASIN') or
+                row.get('状态') or
+                row.get('品牌名称') or
+                row.get('投放链接')
+            )
+            if not has_content:
+                continue
+            row_by_index[ri] = row
+            last_data_ri = max(last_data_ri, ri)
+
+        if last_data_ri < 3:
+            self.log_manage("    没有需要整理的PB offer行")
+            return 0
+
+        protected_rows = set()
+        summary_rows = []
+        for ri in range(3, last_data_ri + 1):
+            row = row_by_index.get(ri, {})
+            if str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT:
+                summary_rows.append(ri)
+                protected_rows.add(ri)
+
+        for summary_ri in summary_rows:
+            summary_row = row_by_index.get(summary_ri, {})
+            summary_key = (
+                str(summary_row.get('ASIN', '') or '').strip(),
+                str(summary_row.get('品牌ID', '') or '').strip(),
+                self.normalize_country_code(summary_row.get('国家代码', '') or ''),
+            )
+            scan_ri = summary_ri + 1
+            while scan_ri <= last_data_ri:
+                row = row_by_index.get(scan_ri, {})
+                if not row:
+                    break
+                if str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT:
+                    break
+                row_key = (
+                    str(row.get('ASIN', '') or '').strip(),
+                    str(row.get('品牌ID', '') or '').strip(),
+                    self.normalize_country_code(row.get('国家代码', '') or ''),
+                )
+                is_summary_child = (
+                    row_key == summary_key
+                    and (
+                        str(row.get('广告系列总花费', '') or '').strip() == '↑'
+                        or str(row.get('总佣金', '') or '').strip() == '↑'
+                    )
+                )
+                if not is_summary_child:
+                    break
+                protected_rows.add(scan_ri)
+                scan_ri += 1
+
+        if protected_rows:
+            self.log_manage(
+                f"    检测到 {len(summary_rows)} 条相同offer统计行，已保护 {len(protected_rows)} 行不参与品牌整理"
+            )
+
+        def build_sort_item(ri, segment_pos):
+            row = row_by_index.get(ri, {})
+            raw_row = []
+            max_col_idx = max(col_indices.values(), default=-1)
+            if max_col_idx >= 0:
+                raw_row = [''] * (max_col_idx + 1)
+                for header, col_idx in col_indices.items():
+                    if col_idx < len(raw_row):
+                        raw_row[col_idx] = row.get(header, '')
+
+            is_pb_row = self.is_pb_offer_row(raw_row, col_indices)
+            brand_key = self.normalize_offer_brand_sort_key(row.get('品牌名称', ''))
+            asin = str(row.get('ASIN', '') or '').strip().upper()
+            country = self.normalize_country_code(row.get('国家代码', '') or '')
+            commission = self.parse_commission_value(row.get('总佣金', ''))
+            return {
+                'row_index': ri,
+                'is_pb': is_pb_row,
+                'brand_key': brand_key,
+                'commission': commission,
+                'asin': asin,
+                'country': country,
+                'original_pos': segment_pos,
+            }
+
+        segments = []
+        current_segment = []
+        for ri in range(3, last_data_ri + 1):
+            if ri in protected_rows:
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+                continue
+            if ri not in row_by_index:
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+                continue
+            current_segment.append(ri)
+        if current_segment:
+            segments.append(current_segment)
+
+        sortable_segments = []
+        expected_moves = 0
+        for segment in segments:
+            if len(segment) <= 1:
+                continue
+            data_rows = [build_sort_item(ri, pos) for pos, ri in enumerate(segment)]
+            sorted_rows = sorted(data_rows, key=lambda r: (
+                0 if r['is_pb'] else 1,
+                r['brand_key'] if r['is_pb'] else '',
+                -r['commission'] if r['is_pb'] else 0,
+                r['asin'] if r['is_pb'] else '',
+                r['country'] if r['is_pb'] else '',
+                r['original_pos'],
+            ))
+            current_order = [row['row_index'] for row in data_rows]
+            desired_order = [row['row_index'] for row in sorted_rows]
+            if current_order == desired_order:
+                continue
+            temp_order = list(current_order)
+            segment_moves = 0
+            for i, target in enumerate(desired_order):
+                j = temp_order.index(target)
+                if j != i:
+                    segment_moves += 1
+                    item = temp_order.pop(j)
+                    temp_order.insert(i, item)
+            expected_moves += segment_moves
+            sortable_segments.append((segment[0], current_order, desired_order))
+
+        if not sortable_segments:
+            self.log_manage("    PB offer品牌顺序已经正确，无需移动")
+            return 0
+
+        self.log_manage(f"    需要移动 {expected_moves} 行来整理PB offer品牌顺序")
+        move_count = 0
+
+        for segment_start_ri, current_order, desired_order in sortable_segments:
+            working_order = list(current_order)
+            data_start_0based = segment_start_ri - 1
+
+            for target_pos, target_row_index in enumerate(desired_order):
+                if self.stop_flag:
+                    self.log_manage("    PB offer品牌整理被停止")
+                    break
+                current_pos = working_order.index(target_row_index)
+                if current_pos == target_pos:
+                    continue
+                if not self.feishu_move_dimension(
+                    token,
+                    spreadsheet_token,
+                    sheet_id,
+                    data_start_0based + current_pos,
+                    data_start_0based + current_pos,
+                    data_start_0based + target_pos
+                ):
+                    self.log_manage("    PB offer品牌整理中断：移动行失败")
+                    break
+                moved = working_order.pop(current_pos)
+                working_order.insert(target_pos, moved)
+                move_count += 1
+                if move_count % 20 == 0:
+                    self.log_manage(f"    PB offer品牌整理进度: {move_count}/{expected_moves}")
+                time.sleep(0.6)
+            if self.stop_flag:
+                break
+
+        self.log_manage(f"  ✅ PB offer品牌整理完成，共执行 {move_count} 次移动")
+        return move_count
     
     def sort_offer_table(self, token):
         """对Offer表格进行排序
         
         排序规则：
         1. 表头行(第1行)、总计行(第2行)固定不动
-        2. 数据行按状态排序：投放中 > 暂停中 > 投放已结束 > 未测试
-        3. 同状态内按总佣金降序排列
+        2. 保护“相同offer统计行”及其关联offer行，不打散汇总分组
+        3. 其余PB/YP offer按品牌、国家、状态、ASIN整理
         """
-        self.log_manage("  对Offer表格行排序...")
+        self.log_manage("  对Offer表格行排序整理...")
         
         spreadsheet_token = self.feishu_spreadsheet_var.get().strip()
         sheet_id = self.feishu_sheet_id_var.get().strip()
@@ -8360,55 +9283,174 @@ class OfferToolApp:
             self.log_manage("    无法读取Offer表格数据")
             return
 
-        if any(str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT for row in feishu_data):
-            self.log_manage("    检测到“相同offer统计行”，已跳过Offer表自动排序，避免打散汇总分组")
-            return
-        
-        # 找到最后一个有内容的数据行（排除总计行 row_index=2）
         last_data_ri = 0
         row_by_index = {}
         for row in feishu_data:
             ri = row.get('row_index')
-            if ri is None or ri == 2:  # 跳过总计行
+            if ri is None or ri < 3:
                 continue
-            if ri >= 3:
-                row_by_index[ri] = row
-                # 检查行是否有实际内容
-                has_content = (
-                    row.get('ASIN') or 
-                    row.get('状态') or 
-                    row.get('品牌名称') or
-                    row.get('总佣金')
-                )
-                if has_content:
-                    last_data_ri = max(last_data_ri, ri)
+            has_content = (
+                row.get('ASIN') or
+                row.get('状态') or
+                row.get('品牌名称') or
+                row.get('投放链接') or
+                row.get('总佣金')
+            )
+            if not has_content:
+                continue
+            row_by_index[ri] = row
+            last_data_ri = max(last_data_ri, ri)
         
         if last_data_ri < 3:
             self.log_manage("    没有需要排序的数据行")
             return
-        
-        # 构建连续的数据行列表（从第3行到最后有内容的行）
-        data_rows = []
+
+        protected_rows = set()
+        summary_rows = []
         for ri in range(3, last_data_ri + 1):
             row = row_by_index.get(ri, {})
             status = str(row.get('状态', '') or '').strip()
             if status == SUMMARY_STATUS_TEXT:
-                continue
-            commission = self.parse_commission_value(row.get('总佣金', ''))
-            data_rows.append({
+                summary_rows.append(ri)
+                protected_rows.add(ri)
+
+        for summary_ri in summary_rows:
+            summary_row = row_by_index.get(summary_ri, {})
+            summary_key = (
+                str(summary_row.get('ASIN', '') or '').strip(),
+                str(summary_row.get('品牌ID', '') or '').strip(),
+                self.normalize_country_code(summary_row.get('国家代码', '') or ''),
+            )
+            scan_ri = summary_ri + 1
+            while scan_ri <= last_data_ri:
+                row = row_by_index.get(scan_ri, {})
+                if not row:
+                    break
+                if str(row.get('状态', '') or '').strip() == SUMMARY_STATUS_TEXT:
+                    break
+                row_key = (
+                    str(row.get('ASIN', '') or '').strip(),
+                    str(row.get('品牌ID', '') or '').strip(),
+                    self.normalize_country_code(row.get('国家代码', '') or ''),
+                )
+                is_summary_child = (
+                    row_key == summary_key
+                    and (
+                        str(row.get('广告系列总花费', '') or '').strip() == '↑'
+                        or str(row.get('总佣金', '') or '').strip() == '↑'
+                    )
+                )
+                if not is_summary_child:
+                    break
+                protected_rows.add(scan_ri)
+                scan_ri += 1
+
+        if protected_rows:
+            self.log_manage(
+                f"    检测到 {len(summary_rows)} 条相同offer统计行，已保护 {len(protected_rows)} 行不参与顺序整理"
+            )
+
+        def build_sort_item(ri, segment_pos):
+            row = row_by_index.get(ri, {})
+            brand_key = self.normalize_offer_brand_sort_key(row.get('品牌名称', ''))
+            country = self.normalize_country_code(row.get('国家代码', '') or '')
+            status = str(row.get('状态', '') or '').strip()
+            asin = str(row.get('ASIN', '') or '').strip().upper()
+            return {
                 'row_index': ri,
-                'status': status,
-                'total_commission': commission
-            })
-        
-        self.log_manage(f"    共 {len(data_rows)} 行数据需要排序")
-        
-        # Offer表数据行从第3行开始（1-based），即0-based索引为2
-        move_count = self.sort_sheet_rows(
-            token, spreadsheet_token, sheet_id,
-            data_rows, data_start_0based=2, table_name="Offer表"
-        )
-        
+                'brand_key': brand_key,
+                'country': country,
+                'status_priority': self.get_offer_sort_status_priority(status),
+                'asin': asin,
+                'original_pos': segment_pos,
+            }
+
+        segments = []
+        current_segment = []
+        for ri in range(3, last_data_ri + 1):
+            if ri in protected_rows:
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+                continue
+            if ri not in row_by_index:
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+                continue
+            current_segment.append(ri)
+        if current_segment:
+            segments.append(current_segment)
+
+        sortable_segments = []
+        expected_moves = 0
+        sortable_row_count = 0
+        for segment in segments:
+            if len(segment) <= 1:
+                continue
+            data_rows = [build_sort_item(ri, pos) for pos, ri in enumerate(segment)]
+            sortable_row_count += len(data_rows)
+            sorted_rows = sorted(data_rows, key=lambda r: (
+                1 if not r['brand_key'] else 0,
+                r['brand_key'],
+                r['country'],
+                r['status_priority'],
+                r['asin'],
+                r['original_pos'],
+            ))
+            current_order = [row['row_index'] for row in data_rows]
+            desired_order = [row['row_index'] for row in sorted_rows]
+            if current_order == desired_order:
+                continue
+            temp_order = list(current_order)
+            segment_moves = 0
+            for i, target in enumerate(desired_order):
+                j = temp_order.index(target)
+                if j != i:
+                    segment_moves += 1
+                    item = temp_order.pop(j)
+                    temp_order.insert(i, item)
+            expected_moves += segment_moves
+            sortable_segments.append((segment[0], current_order, desired_order))
+
+        if not sortable_segments:
+            self.log_manage("    Offer表品牌/状态/ASIN顺序已经正确，无需移动")
+            return
+
+        self.log_manage(f"    共 {sortable_row_count} 行可整理offer，需要执行 {expected_moves} 次移动")
+        move_count = 0
+
+        for segment_start_ri, current_order, desired_order in sortable_segments:
+            working_order = list(current_order)
+            data_start_0based = segment_start_ri - 1
+
+            for target_pos, target_row_index in enumerate(desired_order):
+                if self.stop_flag:
+                    self.log_manage("    Offer顺序整理被停止")
+                    break
+                current_pos = working_order.index(target_row_index)
+                if current_pos == target_pos:
+                    continue
+                if not self.feishu_move_dimension(
+                    token,
+                    spreadsheet_token,
+                    sheet_id,
+                    data_start_0based + current_pos,
+                    data_start_0based + current_pos,
+                    data_start_0based + target_pos
+                ):
+                    self.log_manage("    Offer顺序整理中断：移动行失败")
+                    break
+                moved = working_order.pop(current_pos)
+                working_order.insert(target_pos, moved)
+                move_count += 1
+                if move_count % 20 == 0:
+                    self.log_manage(f"    Offer顺序整理进度: {move_count}/{expected_moves}")
+                    self.update_progress_manage(f"排序Offer表 {move_count}/{expected_moves}")
+                time.sleep(0.6)
+            if self.stop_flag:
+                break
+
         self.log_manage(f"  ✅ Offer表格排序完成，共执行 {move_count} 次移动")
     
     def sort_campaigns_table(self, token):

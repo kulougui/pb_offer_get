@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+
+credentials/google_ads_service_account.json
