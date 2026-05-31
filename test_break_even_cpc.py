@@ -16,6 +16,10 @@ class BreakEvenCpcTests(unittest.TestCase):
         app.extract_brand_and_country_from_campaign_name = OfferToolApp.extract_brand_and_country_from_campaign_name.__get__(app, OfferToolApp)
         app.normalize_country_code = OfferToolApp.normalize_country_code.__get__(app, OfferToolApp)
         app.normalize_brand_key = OfferToolApp.normalize_brand_key.__get__(app, OfferToolApp)
+        app.build_yp_brand_key = OfferToolApp.build_yp_brand_key.__get__(app, OfferToolApp)
+        app.build_yp_row_brand_key = OfferToolApp.build_yp_row_brand_key.__get__(app, OfferToolApp)
+        app.build_yp_transaction_brand_key = OfferToolApp.build_yp_transaction_brand_key.__get__(app, OfferToolApp)
+        app.display_offer_brand_id = OfferToolApp.display_offer_brand_id.__get__(app, OfferToolApp)
         app.campaign_name_matches_brand_country = OfferToolApp.campaign_name_matches_brand_country.__get__(app, OfferToolApp)
         app.parse_commission_value = OfferToolApp.parse_commission_value.__get__(app, OfferToolApp)
         app.extract_tracking_uid_from_link = OfferToolApp.extract_tracking_uid_from_link.__get__(app, OfferToolApp)
@@ -28,6 +32,18 @@ class BreakEvenCpcTests(unittest.TestCase):
         app.build_copy_offer_match_key = OfferToolApp.build_copy_offer_match_key.__get__(app, OfferToolApp)
         app.copy_offer_has_non_key_data = OfferToolApp.copy_offer_has_non_key_data.__get__(app, OfferToolApp)
         app.format_brand_break_even_cpc = OfferToolApp.format_brand_break_even_cpc.__get__(app, OfferToolApp)
+        app.build_ads_brand_campaign_sheet_maps = OfferToolApp.build_ads_brand_campaign_sheet_maps.__get__(app, OfferToolApp)
+        app.detect_platform_from_tracking_link = OfferToolApp.detect_platform_from_tracking_link.__get__(app, OfferToolApp)
+        app.infer_campaign_platform = OfferToolApp.infer_campaign_platform.__get__(app, OfferToolApp)
+        app.build_offer_tracking_link_maps_for_ads_brand = OfferToolApp.build_offer_tracking_link_maps_for_ads_brand.__get__(app, OfferToolApp)
+        app.get_ads_brand_platforms_for_campaigns = OfferToolApp.get_ads_brand_platforms_for_campaigns.__get__(app, OfferToolApp)
+        app.build_ads_brand_sheet_rows = OfferToolApp.build_ads_brand_sheet_rows.__get__(app, OfferToolApp)
+        app.build_offer_group_lookup_for_campaign_summary = OfferToolApp.build_offer_group_lookup_for_campaign_summary.__get__(app, OfferToolApp)
+        app.resolve_campaign_summary_brand_name = OfferToolApp.resolve_campaign_summary_brand_name.__get__(app, OfferToolApp)
+        app.parse_google_mcc_ids = OfferToolApp.parse_google_mcc_ids.__get__(app, OfferToolApp)
+        app.build_break_even_brand_country_offer_index = OfferToolApp.build_break_even_brand_country_offer_index.__get__(app, OfferToolApp)
+        app.build_brand_country_lookup_maps = OfferToolApp.build_brand_country_lookup_maps.__get__(app, OfferToolApp)
+        app.resolve_yp_brand_country_entry = OfferToolApp.resolve_yp_brand_country_entry.__get__(app, OfferToolApp)
         return app
 
     def test_break_even_totals_should_combine_pb_and_yp_commission(self):
@@ -105,6 +121,64 @@ class BreakEvenCpcTests(unittest.TestCase):
         }, lookup)
 
         self.assertIsNone(resolved)
+
+    def test_yp_resolution_should_fallback_by_advert_name_asin_country(self):
+        app = self.make_app()
+        offer_index = app.build_break_even_brand_country_offer_index([
+            {'状态': '', '品牌名称': 'Bcan', '品牌ID': '8888', '国家代码': 'US', 'ASIN': 'B0BCAN0001'},
+            {'状态': '', '品牌名称': 'Other', '品牌ID': '9999', '国家代码': 'US', 'ASIN': 'B0BCAN0001'},
+        ])
+        lookup = app.build_brand_country_lookup_maps(offer_index)
+
+        resolved = app.resolve_yp_brand_country_entry({
+            'asin': 'B0BCAN0001',
+            'advert_name': 'Bcan',
+            'customer_country': 'US',
+            'sale_comm': 10,
+        }, lookup)
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual('bcan', resolved['brand_lower'])
+        self.assertEqual({'8888'}, resolved['brand_ids'])
+
+    def test_yp_resolution_should_fallback_by_advert_name_asin_without_country(self):
+        app = self.make_app()
+        offer_index = app.build_break_even_brand_country_offer_index([
+            {'状态': '', '品牌名称': 'Merach', '品牌ID': '', '国家代码': 'US', 'ASIN': 'B0F8J55GT8'},
+        ])
+        lookup = app.build_brand_country_lookup_maps(offer_index)
+
+        resolved = app.resolve_yp_brand_country_entry({
+            'id': '2026-05-24T00:00:00.000Z_3d869c2e7faa4abc_B0F8J55GT8',
+            'advert_id': '380945',
+            'advert_name': 'Merach',
+            'sale_comm': 12.34,
+        }, lookup)
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual('merach', resolved['brand_lower'])
+        self.assertEqual('US', resolved['country'])
+        self.assertEqual('name:merach', app.build_yp_transaction_brand_key({
+            'advert_name': 'Merach',
+        }, resolved))
+
+    def test_yp_resolution_should_fallback_by_unique_brand_when_asin_missing_from_sheet(self):
+        app = self.make_app()
+        offer_index = app.build_break_even_brand_country_offer_index([
+            {'状态': '', '品牌名称': 'Merach', '品牌ID': '', '国家代码': 'US', 'ASIN': 'B0F8J55GT8'},
+        ])
+        lookup = app.build_brand_country_lookup_maps(offer_index)
+
+        resolved = app.resolve_yp_brand_country_entry({
+            'id': '2026-05-15T00:00:00.000Z_a70c1370c637d17d_B0DPW7JG4K',
+            'advert_id': '380945',
+            'advert_name': 'Merach',
+            'sale_comm': 15.84,
+        }, lookup)
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual('merach', resolved['brand_lower'])
+        self.assertEqual('US', resolved['country'])
 
     def test_resolve_yp_campaign_offer_group_can_use_existing_tracking_link(self):
         app = self.make_app()
@@ -322,6 +396,7 @@ class BreakEvenCpcTests(unittest.TestCase):
         self.assertEqual('eureka', app.normalize_brand_key('Eureka France'))
         self.assertEqual('anker', app.normalize_brand_key('DE-Anker'))
         self.assertEqual('maono', app.normalize_brand_key('Maono_GB'))
+        self.assertEqual('ogery', app.normalize_brand_key('OGERY-Outdoors'))
 
     def test_extract_country_from_campaign_name_should_normalize_gb_to_uk(self):
         app = self.make_app()
@@ -343,6 +418,303 @@ class BreakEvenCpcTests(unittest.TestCase):
             'Maono UK',
             'UK'
         ))
+
+    def test_ads_brand_rows_should_include_recent_5_day_total_cost(self):
+        app = self.make_app()
+        app.calculate_break_even_brand_country_commissions = lambda **kwargs: ({}, {})
+
+        rows = app.build_ads_brand_sheet_rows(
+            campaigns=[
+                {
+                    'account_id': '123',
+                    'account_name': 'ads-a',
+                    'mcc_id': '2160853519',
+                    'mcc_name': 'mcc11',
+                    'campaign_name': 'Anker_US_1',
+                    'status': 'ENABLED',
+                    'brand': 'Anker',
+                    'brand_key': 'anker',
+                    'country': 'US',
+                    'cost_usd': 100.0,
+                    'recent_5_day_cost_usd': 12.34,
+                    'clicks': 10,
+                    'preset_cpc_usd': 1.0,
+                    'avg_cpc_usd': 10.0,
+                },
+                {
+                    'account_id': '123',
+                    'account_name': 'ads-a',
+                    'mcc_id': '2160853519',
+                    'mcc_name': 'mcc11',
+                    'campaign_name': 'Anker_US_2',
+                    'status': 'PAUSED',
+                    'brand': 'Anker',
+                    'brand_key': 'anker',
+                    'country': 'US',
+                    'cost_usd': 20.0,
+                    'recent_5_day_cost_usd': 5.0,
+                    'clicks': 2,
+                    'preset_cpc_usd': 2.0,
+                    'avg_cpc_usd': 10.0,
+                },
+            ],
+            campaign_sheet_rows=[],
+            feishu_data=[],
+            commission_data=[],
+            yp_commission_data=[],
+            start_date_str='2026-05-01',
+            end_date_str='2026-05-21'
+        )
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual('$17.34', rows[0]['近5日总花费'])
+
+    def test_ads_brand_platform_should_not_default_to_pb_without_link(self):
+        app = self.make_app()
+        app.calculate_break_even_brand_country_commissions = lambda **kwargs: ({}, {})
+
+        rows = app.build_ads_brand_sheet_rows(
+            campaigns=[{
+                'account_id': '123',
+                'account_name': 'ads-a',
+                'mcc_id': '2160853519',
+                'mcc_name': 'mcc11',
+                'campaign_name': 'Anker_US_1',
+                'status': 'ENABLED',
+                'brand': 'Anker',
+                'brand_key': 'anker',
+                'country': 'US',
+                'cost_usd': 100.0,
+                'recent_5_day_cost_usd': 0.0,
+            }],
+            campaign_sheet_rows=[],
+            feishu_data=[],
+            commission_data=[],
+            yp_commission_data=[],
+            start_date_str='2026-05-01',
+            end_date_str='2026-05-21'
+        )
+
+        self.assertEqual('', rows[0]['平台'])
+
+    def test_ads_brand_platform_should_use_offer_tracking_link_first(self):
+        app = self.make_app()
+        app.calculate_break_even_brand_country_commissions = lambda **kwargs: ({}, {})
+
+        rows = app.build_ads_brand_sheet_rows(
+            campaigns=[{
+                'account_id': '123',
+                'account_name': 'ads-a',
+                'mcc_id': '2160853519',
+                'mcc_name': 'mcc11',
+                'campaign_name': 'Anker_US_1',
+                'status': 'ENABLED',
+                'brand': 'Anker',
+                'brand_key': 'anker',
+                'country': 'US',
+                'cost_usd': 100.0,
+                'recent_5_day_cost_usd': 0.0,
+            }],
+            campaign_sheet_rows=[{
+                '广告系列名称': 'Anker_US_1',
+                '投放链接': '',
+            }],
+            feishu_data=[{
+                '状态': '投放中',
+                '品牌名称': 'Anker',
+                '国家代码': 'US',
+                '广告系列名称': 'Anker_US_1',
+                '投放链接': 'https://yeahpromos.com/track?pid=abc123&u1={tag1}',
+            }],
+            commission_data=[],
+            yp_commission_data=[],
+            start_date_str='2026-05-01',
+            end_date_str='2026-05-21'
+        )
+
+        self.assertEqual('yp', rows[0]['平台'])
+
+    def test_ads_brand_rows_should_include_empty_account_without_active_or_paused_campaigns(self):
+        app = self.make_app()
+        app.calculate_break_even_brand_country_commissions = lambda **kwargs: ({}, {})
+
+        rows = app.build_ads_brand_sheet_rows(
+            campaigns=[
+                {
+                    'account_id': '456',
+                    'account_name': 'ads-empty',
+                    'mcc_id': '2160853519',
+                    'mcc_name': 'mcc11',
+                    'campaign_name': 'Anker_US_removed',
+                    'status': 'REMOVED',
+                    'brand': 'Anker',
+                    'brand_key': 'anker',
+                    'country': 'US',
+                    'cost_usd': 10.0,
+                    'recent_5_day_cost_usd': 1.0,
+                },
+            ],
+            campaign_sheet_rows=[],
+            feishu_data=[],
+            commission_data=[],
+            yp_commission_data=[],
+            start_date_str='2026-05-01',
+            end_date_str='2026-05-21',
+            accounts=[
+                {
+                    'account_id': '456',
+                    'account_name': 'ads-empty',
+                    'mcc_id': '2160853519',
+                    'mcc_name': 'mcc11',
+                }
+            ]
+        )
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual('ads-empty', rows[0]['ads'])
+        self.assertEqual('456', rows[0]['ID'])
+        self.assertEqual('mcc11', rows[0]['所属mcc'])
+        self.assertEqual('2160853519', rows[0]['mccID'])
+        self.assertNotIn('在投品牌名', rows[0])
+        self.assertNotIn('广告系列总花费', rows[0])
+
+    def test_campaign_summary_brand_name_should_fallback_by_asin_country(self):
+        app = self.make_app()
+        lookup = app.build_offer_group_lookup_for_campaign_summary([
+            {
+                '状态': '投放中',
+                'ASIN': 'B0C3T865C2',
+                '品牌ID': '363072',
+                '品牌名称': 'SIHOO US',
+                '国家代码': 'US',
+                '产品链接': 'https://www.amazon.com/dp/B0C3T865C2',
+                '投放链接': 'https://pboost.me/demo',
+            }
+        ])
+
+        brand_name = app.resolve_campaign_summary_brand_name(
+            offer_key=('B0C3T865C2', '126677', 'US'),
+            offer_summary={},
+            yp_offer_context={},
+            offer_group_lookup=lookup,
+        )
+
+        self.assertEqual('SIHOO US', brand_name)
+
+    def test_parse_google_mcc_ids_should_accept_list_commas_and_newlines(self):
+        app = self.make_app()
+
+        self.assertEqual(
+            ['2160853519', '6885177935', '1234567890'],
+            app.parse_google_mcc_ids('216-085-3519, 6885177935\n1234567890;2160853519')
+        )
+
+    def test_grouped_increment_commission_uses_campaign_group_key(self):
+        app = self.make_app()
+        rows = [{
+            'campaign_name': 'Reolink_US_8388_13291_20260521153755612',
+            '总佣金': '$10.00',
+            '_offer_group_key': ('B0F9F4D9XS', '136519', 'US', 'adg:1'),
+        }]
+
+        app.apply_campaign_increment_commission_delta(
+            rows,
+            {'campaign_commission': {'Reolink_US_8388_13291_20260521153755612': 2.0}},
+            grouped_offer_keys={('B0F9F4D9XS', '136519', 'US')}
+        )
+
+        self.assertEqual('↑', rows[0]['总佣金'])
+        self.assertEqual('↑', rows[0]['新增佣金'])
+
+    def test_increment_delta_should_overwrite_explicit_increment_commission(self):
+        app = self.make_app()
+        rows = [{
+            'campaign_name': 'Merach_US_1',
+            '总佣金': '$56.64',
+            '新增佣金': '$15.84',
+        }]
+
+        app.apply_campaign_increment_commission_delta(
+            rows,
+            {'campaign_commission': {'Merach_US_1': 56.64}},
+            grouped_offer_keys=set()
+        )
+
+        self.assertEqual('$0.00', rows[0]['新增佣金'])
+
+    def test_campaign_background_styles_are_added_for_new_rows(self):
+        app = self.make_app()
+        captured = {}
+        app.log_manage = lambda *args, **kwargs: None
+        app._ensure_sheet_rows = lambda *args, **kwargs: None
+        app.apply_campaigns_style_updates = lambda token, spreadsheet_token, sheet_id, styles: captured.setdefault('styles', styles)
+
+        class Response:
+            def json(self):
+                return {'code': 0}
+
+        original_post = __import__('requests').post
+        try:
+            __import__('requests').post = lambda *args, **kwargs: Response()
+            app.apply_campaigns_sheet_updates(
+                token='token',
+                spreadsheet_token='sheet',
+                sheet_id='XrkOF7',
+                updates=[],
+                new_rows=[{
+                    '状态': '投放中',
+                    '广告系列名称': 'NewCampaign',
+                    '预设CPC': '$1.00',
+                    'CPC': '$0.50',
+                    '品牌收支平衡CPC': '$2.00',
+                    '广告系列总花费': '$3.00',
+                    '总佣金': '$4.00',
+                    'status_color': 'green',
+                }],
+                column_map={
+                    '状态': 'A',
+                    '广告系列名称': 'B',
+                    '预设CPC': 'I',
+                    'CPC': 'J',
+                    '品牌收支平衡CPC': 'K',
+                    '广告系列总花费': 'O',
+                    '总佣金': 'P',
+                },
+                first_empty_row=10
+            )
+        finally:
+            __import__('requests').post = original_post
+
+        bg_by_column = {
+            item['column']: item['background_color']
+            for item in captured.get('styles', [])
+            if item.get('background_color')
+        }
+        self.assertEqual('#F8F9FA', bg_by_column['I'])
+        self.assertEqual('#FAF1D1', bg_by_column['J'])
+        self.assertEqual('#FFF258', bg_by_column['K'])
+        self.assertEqual('#FBBFBC', bg_by_column['O'])
+        self.assertEqual('#D9F5D6', bg_by_column['P'])
+
+    def test_campaign_metric_background_styles_include_summary_rows(self):
+        app = self.make_app()
+
+        styles = app.build_campaign_metric_background_style_updates(
+            rows=[
+                {'row_index': 2, '状态': '相同offer统计行', '广告系列名称': 'Brand | ASIN | 1 | US | pb | 1 | 0 | 0 | -'},
+                {'row_index': 3, '状态': '投放中', '广告系列名称': 'Brand_US_1'},
+            ],
+            column_map={
+                '预设CPC': 'I',
+                'CPC': 'J',
+                '品牌收支平衡CPC': 'K',
+                '广告系列总花费': 'O',
+                '总佣金': 'P',
+            }
+        )
+
+        self.assertEqual({2, 3}, {item['row_index'] for item in styles})
+        self.assertEqual(10, len(styles))
 
 
 if __name__ == '__main__':
